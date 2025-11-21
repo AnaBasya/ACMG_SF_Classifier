@@ -1,0 +1,36 @@
+# Конфигурация VEP
+vep:
+  path: "~/anna/ACMG_SF_Analyzer/databases/vep/ensembl-vep$"
+  cache_dir: "/home/anna/anna/ACMG_SF_Analyzer/databases/vep/.vep"
+  plugins_dir: "/home/anna/anna/ACMG_SF_Analyzer/databases/vep/.vep/Plugins/Plugins"
+  assembly: "GRCh38"
+  
+  # Плагины
+  plugins:
+    spliceai: "SpliceAI"
+    revel: "REVEL"
+    cadd: "CADD"
+  
+  # Кастомные файлы
+  custom_files:
+    gnomad: "gnomADC,vcf,exact,0,AF"
+    clinvar: "/path/to/clinvar.vcf.gz,ClinVar,vcf,exact,0,CLNSIG,ClinPred"
+
+  # Поля для вывода
+  fields: "Consequence,SYMBOL,Feature,HGVSc,HGVSp,EXON,REVEL,SpliceAI,CADD,gnomAD_AF,ClinVar"
+
+# Настройки ACMG
+acmg:
+  thresholds:
+    revel:
+      supporting: 0.290
+      moderate: 0.644
+      strong: 0.773
+      very_strong: 0.932
+    spliceai: 0.2
+    cadd: 25
+
+  quality_control:
+    min_depth: 15
+    min_gq: 20
+    max_af: 0.11
