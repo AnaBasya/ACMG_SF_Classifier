@@ -1,0 +1,14 @@
+# VEP Configuration
+vep:
+  path: "vep"
+  cache_dir: ""
+  plugins_dir: "" 
+  assembly: "GRCh38"
+
+# ACMG Configuration  
+acmg:
+  thresholds:
+    population_af: 0.001
+    revel_supporting: 0.290
+    revel_moderate: 0.644
+    revel_strong: 0.773
