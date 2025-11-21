@@ -1,4 +1,5 @@
 # .gitignore — recommended for ACMG_SF_Analyzer
+
 # Ignore large database folders and generated results
 /databases/
 /results/
@@ -30,3 +31,25 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+# Секретные файлы/ключи
+git
+git.pub
+*.key
+*.pem
+
+# Данные/базы данных
+databases/
+config/
+ACMG_SF_v3.3.tsv
+
+# Временные файлы
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+
+# Логи
+*.log
