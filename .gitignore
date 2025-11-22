@@ -5,8 +5,8 @@
 /results/
 /temp/
 /data/
-/scripts/results_fam_001/
-/scripts/acmg_results/
+/scripts/*
+/databases/*
 /databases/clinvar/clinvar.vcf.gz
 /databases/clinvar/clinvar.vcf.gz.tbi
 /databases/gnomad/*
