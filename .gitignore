@@ -41,6 +41,7 @@ git.pub
 databases/
 config/
 ACMG_SF_v3.3.tsv
+ACMG_SF_v3.3.csv
 
 # Временные файлы
 __pycache__/
