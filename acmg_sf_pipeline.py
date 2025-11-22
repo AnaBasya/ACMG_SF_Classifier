@@ -23,6 +23,7 @@ Clinical Bioinformatics Team of the Research Centre for Medical Genetics (Code b
 from __future__ import annotations
 import os
 import sys
+import csv
 import argparse
 import json
 import gzip
@@ -165,10 +166,23 @@ def run_cmd(cmd: List[str], check=True) -> subprocess.CompletedProcess:
     return proc
 
 def vep_available(vep_cmd: str = "vep") -> bool:
+    cmd = ["conda", "run", "-n", "vep", vep_cmd, "--help"]
     try:
-        p = subprocess.run([vep_cmd, "--version"], capture_output=True, text=True, timeout=10)
-        return p.returncode == 0
-    except Exception:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            logger.warning(f"VEP check failed with return code {p.returncode}")
+            if p.stderr:
+                logger.warning(f"VEP stderr: {p.stderr.strip()}")
+            return False
+        return True
+    except FileNotFoundError:
+        logger.warning("Conda executable not found in PATH.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("VEP check timed out (conda run took too long).")
+        return False
+    except Exception as e:
+        logger.warning(f"VEP check failed with exception: {e}")
         return False
 
 def vcf_has_csq(vcf_path: str) -> bool:
@@ -219,11 +233,12 @@ def parse_protein_pos(hgvsp: str) -> Optional[int]:
 # ---------------------------
 # Gene-specific rules loader
 # ---------------------------
-def load_acmg_tsv(tsv_path: str) -> Dict[str, Dict[str,Any]]:
-    """
-    Load ACMG SF TSV and derive common per-gene flags.
 
-    The TSV contains many columns and gene-specific guidance.
+def load_acmg_tsv(tsv_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load ACMG SF TSV (or CSV) and derive common per-gene flags.
+
+    The file contains many columns and gene-specific guidance.
     We parse out fields that affect automated decision rules:
       - reportable: whether gene is reportable as a secondary finding (Reportable as SF == Yes)
       - moi/inheritance
@@ -233,39 +248,142 @@ def load_acmg_tsv(tsv_path: str) -> Dict[str, Dict[str,Any]]:
          lof_not_reportable, truncating_only
     The rules dict is keyed by gene symbol.
     """
-    df = pd.read_csv(tsv_path, sep="\t", dtype=str).fillna("")
-    rules: Dict[str, Dict[str,Any]] = {}
+    # 1. Determine separator based on file extension (.csv -> comma, others -> tab)
+    if tsv_path.lower().endswith(".csv"):
+        sep = ","
+        logger.info(f"Detected CSV format for rules file: {tsv_path}")
+    else:
+        sep = "\t"
+        logger.info(f"Detected TSV/TXT format for rules file: {tsv_path}")
+
+    # 2. Attempt to read using Pandas with robust settings
+    # engine='python' is used because it is more robust against "Buffer overflow" 
+    # C-engine errors and malformed quoting often found in manually edited files.
+    try:
+        df = pd.read_csv(
+            tsv_path, 
+            sep=sep, 
+            dtype=str, 
+            on_bad_lines='skip', 
+            engine='python'
+        ).fillna("")
+    except Exception as e:
+        logger.warning("Pandas read failed: %s. Switching to manual parsing with 'csv' module.", e)
+        return _load_acmg_tsv_manual(tsv_path, sep)
+    
+    # If we successfully read the file but it's empty, try manual parsing
+    if df.empty:
+        logger.warning("DataFrame is empty after Pandas load, trying manual parsing.")
+        return _load_acmg_tsv_manual(tsv_path, sep)
+    
+    # 3. Parse the loaded DataFrame
+    rules: Dict[str, Dict[str, Any]] = {}
     for _, row in df.iterrows():
-        gene = row.get("Gene Symbol") or row.get("Gene") or ""
-        if not gene:
+        # Clean up column names (convert keys to string and strip whitespace)
+        row_dict = {str(k).strip(): v for k, v in row.to_dict().items()}
+        
+        # Use helper function to extract logic
+        gene_data = _parse_gene_row(row_dict)
+        if gene_data:
+            rules[gene_data['symbol']] = gene_data['data']
+            
+    logger.info("Loaded gene-specific rules for %d genes (via Pandas)", len(rules))
+    return rules
+
+
+def _load_acmg_tsv_manual(tsv_path: str, sep: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Manual fallback parser for problematic TSV/CSV files.
+    Uses Python's built-in csv module to handle quotes and delimiters correctly.
+    """
+    rules: Dict[str, Dict[str, Any]] = {}
+    
+    # Attempt different encodings common in Excel exports (UTF-8, Latin-1, CP1252)
+    encodings = ['utf-8', 'latin-1', 'cp1252']
+    
+    for enc in encodings:
+        try:
+            with open(tsv_path, 'r', encoding=enc, newline='') as f:
+                # csv.DictReader handles headers and quotes automatically
+                reader = csv.DictReader(f, delimiter=sep)
+                
+                # Normalize headers (strip whitespace from column names)
+                if reader.fieldnames:
+                    reader.fieldnames = [str(name).strip() for name in reader.fieldnames]
+                
+                for row in reader:
+                    try:
+                        gene_data = _parse_gene_row(row)
+                        if gene_data:
+                            rules[gene_data['symbol']] = gene_data['data']
+                    except Exception:
+                        continue
+            
+            # If we successfully loaded rules, stop trying other encodings
+            if rules:
+                logger.info("Manually loaded gene-specific rules for %d genes (encoding: %s)", len(rules), enc)
+                return rules
+                
+        except Exception as e:
+            logger.debug(f"Failed to read with encoding {enc}: {e}")
             continue
-        gene = str(gene).strip()
-        reportable_field = row.get("Reportable as SF") or ""
-        reportable = str(reportable_field).strip().lower() == "yes"
-        moi = row.get("MOI") or row.get("Inheritance") or ""
-        variants_to_report = row.get("Variants to report") or ""
-        reporting_guidance = row.get("Reporting Guidance Comment") or ""
-        mechanism = row.get("Механизм") or row.get("Mechanism") or ""
-        guidance_text = " ".join([str(reporting_guidance or ""), str(mechanism or ""), str(variants_to_report or "")]).lower()
-        special_flags = {
-            "require_biallelic": bool("biallelic" in guidance_text or "2 variants" in variants_to_report.lower() or "2 het" in variants_to_report.lower()),
-            "report_truncating_only": ("truncating" in guidance_text and "only" in guidance_text) or ("truncating variants only" in variants_to_report.lower()),
-            "report_missense_only": ("missense" in guidance_text and ("only" in guidance_text or "только" in guidance_text)),
-            # treat common GOF phrases as forbidding LOF
-            "lof_not_reportable": any(x in guidance_text for x in ("gain-of-function", "gof", "go f", "go f")) or ("gof" in guidance_text),
-            "truncating_only": "truncating variants only" in guidance_text or "truncating" in variants_to_report.lower()
-        }
-        rules[gene] = {
+            
+    logger.error("Failed to parse rules file manually with any encoding.")
+    return {}
+
+
+def _parse_gene_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Helper function to extract logic from a single row dictionary.
+    Used by both Pandas and Manual loaders to ensure consistent logic.
+    """
+    # Flexible column name matching for Gene Symbol
+    gene = row.get("Gene Symbol") or row.get("Gene") or row.get("GENE") or ""
+    if not gene:
+        return None
+    
+    gene = str(gene).strip()
+    
+    # Reportable status
+    reportable_field = row.get("Reportable as SF") or ""
+    reportable = str(reportable_field).strip().lower() == "yes"
+    
+    # Extract other fields
+    moi = row.get("MOI") or row.get("Inheritance") or ""
+    variants_to_report = row.get("Variants to report") or ""
+    reporting_guidance = row.get("Reporting Guidance Comment") or ""
+    # Note: preserving Russian key "Механизм" as per original code
+    mechanism = row.get("Механизм") or row.get("Mechanism") or ""
+    
+    # Combine text fields for keyword searching (case-insensitive)
+    guidance_text = " ".join([
+        str(reporting_guidance or ""), 
+        str(mechanism or ""), 
+        str(variants_to_report or "")
+    ]).lower()
+    
+    # Heuristic flags based on text description (Preserving original keywords)
+    special_flags = {
+        "require_biallelic": bool("biallelic" in guidance_text or "2 variants" in str(variants_to_report).lower() or "2 het" in str(variants_to_report).lower()),
+        "report_truncating_only": ("truncating" in guidance_text and "only" in guidance_text) or ("truncating variants only" in str(variants_to_report).lower()),
+        "report_missense_only": ("missense" in guidance_text and ("only" in guidance_text or "только" in guidance_text)),
+        # Treat common GOF phrases as forbidding LOF (PVS1)
+        "lof_not_reportable": any(x in guidance_text for x in ("gain-of-function", "gof", "go f")) or ("gof" in guidance_text),
+        "truncating_only": "truncating variants only" in guidance_text or "truncating" in str(variants_to_report).lower()
+    }
+    
+    return {
+        'symbol': gene,
+        'data': {
             "reportable": reportable,
             "moi": moi,
             "variants_to_report": variants_to_report,
             "reporting_guidance": reporting_guidance,
             "mechanism": mechanism,
             "special_flags": special_flags,
-            "raw_row": row.to_dict()
+            "raw_row": row
         }
-    logger.info("Loaded gene-specific rules for %d genes", len(rules))
-    return rules
+    }
 
 # ---------------------------
 # Database manager with ClinVar protein-index caching
@@ -1096,15 +1214,35 @@ def run_local_vep(in_vcf: str, out_vcf: str, vep_cmd: str, vep_cache: Optional[s
     Run VEP locally to annotate VCF. The user must provide vep executable path and optionally cache and fasta.
     extra_args: list of extra arguments (e.g. ["--plugin", "SpliceAI,snv,0.2", "--plugin", "REVEL"])
     """
-    cmd = [vep_cmd, "--input_file", in_vcf, "--output_file", out_vcf, "--vcf", "--compress_output", "bgzip", "--offline", "--cache", "--everything", "--fork", str(threads)]
+    conda_prefix = ["conda", "run", "--no-capture-output", "-n", "vep"]
+    
+    # Added "--force_overwrite" to prevent errors when re-running the pipeline
+    vep_args = [
+        vep_cmd, 
+        "--input_file", in_vcf, 
+        "--output_file", out_vcf, 
+        "--vcf", 
+        "--compress_output", "bgzip", 
+        "--offline", 
+        "--cache", 
+        "--everything", 
+        "--fork", str(threads),
+        "--force_overwrite" 
+    ]
+    
     if vep_cache:
-        cmd += ["--dir_cache", vep_cache]
+        vep_args += ["--dir_cache", vep_cache]
     if fasta:
-        cmd += ["--fasta", fasta]
+        vep_args += ["--fasta", fasta]
     if extra_args:
-        cmd += extra_args
-    logger.info("Running VEP. Ensure VEP cache and plugins are configured correctly.")
+        vep_args += extra_args
+    
+    # Construct the full command
+    cmd = conda_prefix + vep_args
+    
+    logger.info("Running VEP inside 'vep' conda environment. Ensure env 'vep' exists.")
     run_cmd(cmd)
+    
     gz = out_vcf if out_vcf.endswith(".gz") else out_vcf + ".gz"
     try:
         run_cmd(["tabix", "-p", "vcf", gz], check=False)
@@ -1384,101 +1522,101 @@ def process_vcf(proband_vcf: str,
                     v.automated_class = "Likely pathogenic"
                     v.manual_reasons.append(f"Automated DB-driven override to Likely Pathogenic ({src})")
 
-# ---------------------------
-# outputs
-# ---------------------------
-rows = []
-manual_rows = []
-auto_rows = []
+    # ---------------------------
+    # outputs
+    # ---------------------------
+    rows = []
+    manual_rows = []
+    auto_rows = []
 
-for v in candidates:
-    # recompute/ensure totals & class are up to date
-    total = 0
-    for _, pts in v.criteria_points.items():
-        try:
-            total += int(pts)
-        except Exception:
+    for v in candidates:
+        # recompute/ensure totals & class are up to date
+        total = 0
+        for _, pts in v.criteria_points.items():
             try:
-                total += float(pts)
+                total += int(pts)
             except Exception:
-                pass
-    v.total_points = int(total)
-    v.automated_class = engine._classify_by_points(v.total_points)
+                try:
+                    total += float(pts)
+                except Exception:
+                    pass
+        v.total_points = int(total)
+        v.automated_class = engine._classify_by_points(v.total_points)
 
-    # If "aggressive" DB-driven override is desired it was already applied above;
-    # here we rely on v.automated_class and v.manual_review values.
+        # If "aggressive" DB-driven override is desired it was already applied above;
+        # here we rely on v.automated_class and v.manual_review values.
 
-    row = {
-        "sample": v.sample,
-        "chrom": v.chrom,
-        "pos": v.pos,
-        "ref": v.ref,
-        "alt": v.alt,
-        "gene": v.gene,
-        "transcript": v.transcript,
-        "consequence": v.consequence,
-        "hgvsc": v.hgvsc,
-        "hgvsp": v.hgvsp,
-        "exon": v.exon,
-        "is_last_exon": v.is_last_exon,
-        "gnomad_af": v.gnomad_af,
-        "revel": v.revel,
-        "mutpred2": v.mutpred2,
-        "spliceai": v.spliceai,
-        "cadd": v.cadd,
-        "nmd": v.nmd,
-        "proband_gt": v.proband_gt,
-        "father_gt": v.father_gt,
-        "mother_gt": v.mother_gt,
-        "proband_dp": v.proband_dp,
-        "proband_ad": v.proband_ad,
-        "proband_ab": v.proband_ab,
-        "db_hits": ";".join([f"{c}|{s}" for (c,s) in v.db_hits]) if v.db_hits else "",
-        "criteria_assigned": ";".join(v.criteria_assigned),
-        "criteria_points": json.dumps(v.criteria_points, ensure_ascii=False),
-        "total_points": v.total_points,
-        "automated_class": v.automated_class,
-        "manual_review": v.manual_review,
-        "manual_reasons": ";".join(v.manual_reasons)
+        row = {
+            "sample": v.sample,
+            "chrom": v.chrom,
+            "pos": v.pos,
+            "ref": v.ref,
+            "alt": v.alt,
+            "gene": v.gene,
+            "transcript": v.transcript,
+            "consequence": v.consequence,
+            "hgvsc": v.hgvsc,
+            "hgvsp": v.hgvsp,
+            "exon": v.exon,
+            "is_last_exon": v.is_last_exon,
+            "gnomad_af": v.gnomad_af,
+            "revel": v.revel,
+            "mutpred2": v.mutpred2,
+            "spliceai": v.spliceai,
+            "cadd": v.cadd,
+            "nmd": v.nmd,
+            "proband_gt": v.proband_gt,
+            "father_gt": v.father_gt,
+            "mother_gt": v.mother_gt,
+            "proband_dp": v.proband_dp,
+            "proband_ad": v.proband_ad,
+            "proband_ab": v.proband_ab,
+            "db_hits": ";".join([f"{c}|{s}" for (c,s) in v.db_hits]) if v.db_hits else "",
+            "criteria_assigned": ";".join(v.criteria_assigned),
+            "criteria_points": json.dumps(v.criteria_points, ensure_ascii=False),
+            "total_points": v.total_points,
+            "automated_class": v.automated_class,
+            "manual_review": v.manual_review,
+            "manual_reasons": ";".join(v.manual_reasons)
+        }
+        rows.append(row)
+
+        # Only Pathogenic / Likely pathogenic are considered secondary findings.
+        # Put them into manual or automated lists depending on manual_review flag.
+        if v.automated_class in ("Pathogenic", "Likely pathogenic"):
+            if v.manual_review:
+                manual_rows.append(row)
+            else:
+                auto_rows.append(row)
+
+    # write outputs
+    out_all = os.path.join(outdir, "all_candidates.csv")
+    out_manual = os.path.join(outdir, "manual_review_list.csv")
+    out_auto = os.path.join(outdir, "auto_conclusions.csv")
+
+    pd.DataFrame(rows).to_csv(out_all, index=False)
+    pd.DataFrame(manual_rows).to_csv(out_manual, index=False)
+    pd.DataFrame(auto_rows).to_csv(out_auto, index=False)
+
+    # run metadata 
+    run_info = {
+        "proband_vcf": proband_vcf,
+        "annotated_vcf": annotated_vcf,
+        "vep_cmd": vep_cmd,
+        "vep_cache": vep_cache,
+        "fasta": fasta,
+        "acmg_tsv": acmg_tsv,
+        "db_paths": db_paths,
+        "num_candidates_total": len(rows),
+        "num_manual_plp": len(manual_rows),
+        "num_auto_plp": len(auto_rows),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
-    rows.append(row)
+    with open(os.path.join(outdir, "run_info.json"), "w", encoding="utf-8") as fh:
+        json.dump(run_info, fh, indent=2)
 
-    # Only Pathogenic / Likely pathogenic are considered secondary findings.
-    # Put them into manual or automated lists depending on manual_review flag.
-    if v.automated_class in ("Pathogenic", "Likely pathogenic"):
-        if v.manual_review:
-            manual_rows.append(row)
-        else:
-            auto_rows.append(row)
-
-# write outputs
-out_all = os.path.join(outdir, "all_candidates.csv")
-out_manual = os.path.join(outdir, "manual_review_list.csv")
-out_auto = os.path.join(outdir, "auto_conclusions.csv")
-
-pd.DataFrame(rows).to_csv(out_all, index=False)
-pd.DataFrame(manual_rows).to_csv(out_manual, index=False)
-pd.DataFrame(auto_rows).to_csv(out_auto, index=False)
-
-# run metadata 
-run_info = {
-    "proband_vcf": proband_vcf,
-    "annotated_vcf": annotated_vcf,
-    "vep_cmd": vep_cmd,
-    "vep_cache": vep_cache,
-    "fasta": fasta,
-    "acmg_tsv": acmg_tsv,
-    "db_paths": db_paths,
-    "num_candidates_total": len(rows),
-    "num_manual_plp": len(manual_rows),
-    "num_auto_plp": len(auto_rows),
-    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-}
-with open(os.path.join(outdir, "run_info.json"), "w", encoding="utf-8") as fh:
-    json.dump(run_info, fh, indent=2)
-
-logger.info("Wrote outputs: %s, %s, %s", out_all, out_manual, out_auto)
-logger.info("Run summary: candidates_total=%d automated_PLP=%d manual_PLP=%d", len(rows), len(auto_rows), len(manual_rows))
+    logger.info("Wrote outputs: %s, %s, %s", out_all, out_manual, out_auto)
+    logger.info("Run summary: candidates_total=%d automated_PLP=%d manual_PLP=%d", len(rows), len(auto_rows), len(manual_rows))
 
 # ---------------------------
 # CLI
