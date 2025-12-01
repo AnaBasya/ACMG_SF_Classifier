@@ -92,45 +92,36 @@ python acmg_sf_classifier.py \\
   --acmg-table ACMG_SF_v3.3_full.csv \\
   --run-vep-dbnsfp \\
   --db-paths-json config/db_paths.json
-2. Batch Mode (Processing a Cohort)
+```
 
-This will recursively process all samples found in data/data_batch/ and save aggregated results to batch_results/.
+### 2. Batch Mode (Processing a Cohort)
+This will recursively process all samples found in `data/data_batch/` and save aggregated results to `batch_results/`.
 
-code
-Bash
-download
-content_copy
-expand_less
+```bash
 python acmg_sf_classifier.py \\
   --batch-input-dir data/data_batch \\
   --outdir batch_results \\
   --acmg-table ACMG_SF_v3.3_full.csv \\
   --db-paths-json config/db_paths.json \\
   --exons-file data/exons.csv
-Setup & Requirements
+```
 
-Environment:
+## Setup & Requirements
 
-code
-Bash
-download
-content_copy
-expand_less
-pip install -r scripts/requirements.txt
-# Requires: pandas, pysam, cyvcf2, intervaltree
+1. **Environment:**
+   ```bash
+   pip install -r scripts/requirements.txt
+   # Requires: pandas, pysam, cyvcf2, intervaltree
+   ```
+2. **System Tools:**
+   - `vep` (if using --run-vep-dbnsfp)
+   - `bcftools` + `tabix` (required for VCF manipulation)
 
-System Tools:
+## Outputs
 
-vep (if using --run-vep-dbnsfp)
+- **`auto_conclusions.csv`**: High-confidence Pathogenic/Likely Pathogenic variants. Ready for report drafting.
+- **`manual_review_list.csv`**: Complex cases (Recessive single hits, VUS with strong in-silico scores, ClinVar conflicts).
+- **`run_info.json`**: Metadata about the run (counts, paths, timestamps).
 
-bcftools + tabix (required for VCF manipulation)
-
-Outputs
-
-auto_conclusions.csv: High-confidence Pathogenic/Likely Pathogenic variants. Ready for report drafting.
-
-manual_review_list.csv: Complex cases (Recessive single hits, VUS with strong in-silico scores, ClinVar conflicts).
-
-run_info.json: Metadata about the run (counts, paths, timestamps).
-
-Developed for clinical NGS workflows at RCMG ("Genome" Centre).
+---
+*Developed for clinical NGS workflows at RCMG ("Genome" Centre).*
