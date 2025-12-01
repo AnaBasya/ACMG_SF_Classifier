@@ -5,7 +5,7 @@
 /results/
 /temp/
 /data/
-/scripts/*
+/preprocessing/*
 /databases/*
 /databases/clinvar/clinvar.vcf.gz
 /databases/clinvar/clinvar.vcf.gz.tbi
