@@ -1,0 +1,117 @@
+Gene Symbol;HGNC ID;MONDO Disease Name;MONDO ID;MOI;Gene-Disease Validity;Variants to report
+ABCD1;HGNC:61;adrenoleukodystrophy;MONDO:0018544;XL;Definitive;All hemi or homozygous P and LP or 2 het. P/LP variants
+ACTA2;HGNC:130;multisystemic smooth muscle dysfunction syndrome;MONDO:0013452;AD;Definitive;All P and LP
+ACTC1;HGNC:143;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+ACTC1;HGNC:143;dilated cardiomyopathy;MONDO:0005021;AD;Moderate;All P and LP
+ACVRL1;HGNC:175;telangiectasia, hereditary hemorrhagic, type 2;MONDO:0010880;AD;Definitive;All P and LP
+APC;HGNC:583;classic or attenuated familial adenomatous polyposis;MONDO:0021057;AD;Definitive;All P and LP
+APOB;HGNC:603;hypercholesterolemia, autosomal dominant, type B;MONDO:0007751;AD;Definitive;All P and LP
+ATP7B;HGNC:870;Wilson disease;MONDO:0010200;AR;Definitive;P and LP (2 variants)
+BAG3;HGNC:939;myofibrillar myopathy;MONDO:0018943;AD;Definitive;All P and LP
+BAG3;HGNC:939;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+BMPR1A;HGNC:1076;juvenile polyposis syndrome;MONDO:0017380;AD;Definitive;All P and LP
+BRCA1;HGNC:1100;BRCA1-related cancer predisposition;MONDO:0700268;AD;Definitive;All P and LP
+BRCA1;HGNC:1100;Fanconi anemia, complementation group S;MONDO:0054748;AR;Definitive;All P and LP
+BRCA2;HGNC:1101;Fanconi anemia complementation group D1;MONDO:0011584;AR;Definitive;All P and LP
+BRCA2;HGNC:1101;BRCA2-related cancer predisposition;MONDO:0700269;AD;Definitive;All P and LP
+BTD;HGNC:1122;biotinidase deficiency;MONDO:0009665;AR;Definitive;P and LP (2 variants)
+CACNA1S;HGNC:1397;malignant hyperthermia, susceptibility to, 5;MONDO:0011163;AD;Moderate;All P and LP
+CALM1;HGNC:1442;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AD;Moderate;All P and LP
+CALM1;HGNC:1442;long QT syndrome;MONDO:0002442;AD;Definitive;All P and LP
+CALM2;HGNC:1445;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AD;Moderate;All P and LP
+CALM2;HGNC:1445;long QT syndrome;MONDO:0002442;AD;Definitive;All P and LP
+CALM3;HGNC:1449;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AD;Moderate;All P and LP
+CALM3;HGNC:1449;long QT syndrome;MONDO:0002442;AD;Definitive;All P and LP
+CASQ2;HGNC:1513;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AR;Definitive;P and LP (2 variants)
+COL3A1;HGNC:2201;Ehlers-Danlos syndrome, vascular type;MONDO:0017314;AD;Definitive;All P and LP
+CYP27A1;HGNC:2605;cerebrotendinous xanthomatosis;MONDO:0008948;AR;Definitive;P and LP (2 variants)
+DES;HGNC:2770;arrhythmogenic right ventricular cardiomyopathy;MONDO:0016587;AD;Moderate;All P and LP
+DES;HGNC:2770;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+DSC2;HGNC:3036;familial isolated arrhythmogenic right ventricular dysplasia;MONDO:0016342;AD;Definitive;All P and LP
+DSG2;HGNC:3049;arrhythmogenic right ventricular cardiomyopathy;MONDO:0016587;AD;Definitive;All P and LP
+DSP;HGNC:3052;arrhythmogenic cardiomyopathy with wooly hair and keratoderma;MONDO:0011581;AD;Definitive;All P and LP
+ENG;HGNC:3349;telangiectasia, hereditary hemorrhagic, type 1;MONDO:0008535;AD;Definitive;All P and LP
+FBN1;HGNC:3603;Marfan syndrome;MONDO:0007947;AD;Definitive;All P and LP
+FBN1;HGNC:3603;familial thoracic aortic aneurysm and aortic dissection;MONDO:0019625;AD;Definitive;All P and LP
+FLNC;HGNC:3756;myofibrillar myopathy;MONDO:0018943;AD;Definitive;All P and LP
+FLNC;HGNC:3756;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+GAA;HGNC:4065;glycogen storage disease II;MONDO:0009290;AR;Definitive;P and LP (2 variants)
+GLA;HGNC:4296;Fabry disease;MONDO:0010526;XL;Definitive;All hemi, het, homozygous P and LP
+HFE;HGNC:4886;hemochromatosis type 1;MONDO:0021001;AR;Definitive;p.C282Y homozygotes only
+HNF1A;HGNC:11621;monogenic diabetes;MONDO:0015967;AD;Definitive;All P and LP
+KCNH2;HGNC:6251;long QT syndrome;MONDO:0002442;AD;Definitive;All P and LP
+KCNH2;HGNC:6251;short QT syndrome;MONDO:0000453;AD;Definitive;All P and LP
+KCNQ1;HGNC:6294;Jervell and Lange-Nielsen syndrome;MONDO:0002441;AR;Definitive;All P and LP
+KCNQ1;HGNC:6294;short QT syndrome;MONDO:0000453;AD;Strong;All P and LP
+KCNQ1;HGNC:6294;long QT syndrome;MONDO:0002442;AD;Definitive;All P and LP
+LDLR;HGNC:6547;hypercholesterolemia, familial, 1;MONDO:0007750;SD;Definitive;All P and LP
+LMNA;HGNC:6636;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+MAX;HGNC:6913;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+MEN1;HGNC:7010;multiple endocrine neoplasia type 1;MONDO:0007540;AD;Definitive;All P and LP
+MLH1;HGNC:7127;Lynch syndrome;MONDO:0005835;AD;Definitive;All P and LP
+MLH1;HGNC:7127;mismatch repair cancer syndrome 1;MONDO:0010159;AR;Definitive;All P and LP
+MSH2;HGNC:7325;Lynch syndrome;MONDO:0005835;AD;Definitive;All P and LP
+MSH2;HGNC:7325;mismatch repair cancer syndrome 1;MONDO:0010159;AR;Definitive;All P and LP
+MSH6;HGNC:7329;mismatch repair cancer syndrome 1;MONDO:0010159;AR;Definitive;All P and LP
+MSH6;HGNC:7329;Lynch syndrome;MONDO:0005835;AD;Definitive;All P and LP
+MUTYH;HGNC:7527;familial adenomatous polyposis 2;MONDO:0012041;AR;Definitive;P and LP (2 variants)
+MYBPC3;HGNC:7551;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+MYH11;HGNC:7569;familial thoracic aortic aneurysm and aortic dissection;MONDO:0019625;AD;Definitive;All P and LP
+MYH7;HGNC:7577;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+MYH7;HGNC:7577;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+MYL2;HGNC:7583;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+MYL3;HGNC:7584;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+NF2;HGNC:7773;NF2-related schwannomatosis;MONDO:0007039;AD;Definitive;All P and LP
+OTC;HGNC:8512;ornithine carbamoyltransferase deficiency;MONDO:0010703;XL;Definitive;All hemi, het, homozygous P and LP
+PALB2;HGNC:26144;Fanconi anemia complementation group N;MONDO:0012565;AR;Definitive;All P and LP
+PALB2;HGNC:26144;PALB2-related cancer predisposition;MONDO:0700272;AD;Definitive;All P and LP
+PCSK9;HGNC:20001;hypercholesterolemia, autosomal dominant, 3;MONDO:0011369;AD;Definitive;All P and LP
+PKP2;HGNC:9024;arrhythmogenic right ventricular cardiomyopathy;MONDO:0016587;AD;Definitive;All P and LP
+PLN;HGNC:9080;arrhythmogenic right ventricular cardiomyopathy;MONDO:0016587;AD;Moderate;All P and LP
+PLN;HGNC:9080;intrinsic cardiomyopathy;MONDO:0000591;AD;Definitive;All P and LP
+PMS2;HGNC:9122;Lynch syndrome;MONDO:0005835;AD;Definitive;All P and LP
+PMS2;HGNC:9122;mismatch repair cancer syndrome 1;MONDO:0010159;AR;Definitive;All P and LP
+PRKAG2;HGNC:9386;PRKAG2-related cardiomyopathy;MONDO:0800484;AD;Definitive;All P and LP
+PTEN;HGNC:9588;PTEN hamartoma tumor syndrome;MONDO:0017623;AD;Definitive;All P and LP
+RB1;HGNC:9884;retinoblastoma;MONDO:0008380;AD;Definitive;All P and LP
+RBM20;HGNC:27424;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+RET;HGNC:9967;multiple endocrine neoplasia type 2B;MONDO:0008082;AD;Definitive;All P and LP
+RET;HGNC:9967;multiple endocrine neoplasia type 2A;MONDO:0008234;AD;Definitive;All P and LP
+RPE65;HGNC:10294;RPE65-related recessive retinopathy;MONDO:0100368;AR;Definitive;P and LP (2 variants)
+RYR1;HGNC:10483;malignant hyperthermia, susceptibility to, 1;MONDO:0007783;AD;Definitive;All P and LP
+RYR2;HGNC:10484;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AD;Definitive;All P and LP
+SCN5A;HGNC:10593;familial long QT syndrome;MONDO:0019171;AD;Definitive;All P and LP
+SCN5A;HGNC:10593;Brugada syndrome;MONDO:0015263;AD;Definitive;All P and LP
+SCN5A;HGNC:10593;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+SCN5A;HGNC:10593;cardiac rhythm disease;MONDO:0007263;AD;Definitive;All P and LP
+SDHAF2;HGNC:26034;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+SDHB;HGNC:10681;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+SDHC;HGNC:10682;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+SDHD;HGNC:10683;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+SMAD3;HGNC:6769;aneurysm-osteoarthritis syndrome;MONDO:0013426;AD;Definitive;All P and LP
+SMAD3;HGNC:6769;familial thoracic aortic aneurysm and aortic dissection;MONDO:0019625;AD;Definitive;All P and LP
+SMAD4;HGNC:6770;juvenile polyposis/hereditary hemorrhagic telangiectasia syndrome;MONDO:0008278;AD;Definitive;All P and LP
+STK11;HGNC:11389;Peutz-Jeghers syndrome;MONDO:0008280;AD;Definitive;All P and LP
+TGFBR1;HGNC:11772;Loeys-Dietz syndrome;MONDO:0018954;AD;Definitive;All P and LP
+TGFBR1;HGNC:11772;familial thoracic aortic aneurysm and aortic dissection;MONDO:0019625;AD;Definitive;All P and LP
+TGFBR2;HGNC:11773;Loeys-Dietz syndrome 2;MONDO:0012427;AD;Definitive;All P and LP
+TGFBR2;HGNC:11773;familial thoracic aortic aneurysm and aortic dissection;MONDO:0019625;AD;Definitive;All P and LP
+TMEM127;HGNC:26038;hereditary pheochromocytoma-paraganglioma;MONDO:0017366;AD;Definitive;All P and LP
+TMEM43;HGNC:28472;arrhythmogenic right ventricular dysplasia 5;MONDO:0011459;AD;Definitive;All P and LP
+TNNC1;HGNC:11943;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+TNNC1;HGNC:11943;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+TNNI3;HGNC:11947;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+TNNI3;HGNC:11947;dilated cardiomyopathy;MONDO:0005021;AD;Strong;All P and LP
+TNNT2;HGNC:11949;hypertrophic cardiomyopathy;MONDO:0005045;AD;Moderate;All P and LP
+TNNT2;HGNC:11949;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;All P and LP
+TP53;HGNC:11998;Li-Fraumeni syndrome;MONDO:0018875;AD;Definitive;All P and LP
+TPM1;HGNC:12010;hypertrophic cardiomyopathy;MONDO:0005045;AD;Definitive;All P and LP
+TPM1;HGNC:12010;dilated cardiomyopathy;MONDO:0005021;AD;Moderate;All P and LP
+TRDN;HGNC:12261;catecholaminergic polymorphic ventricular tachycardia;MONDO:0017990;AR;Definitive;All P and LP
+TRDN;HGNC:12261;long QT syndrome;MONDO:0002442;AR;Strong;All P and LP
+TSC1;HGNC:12362;tuberous sclerosis;MONDO:0001734;AD;Definitive;All P and LP
+TSC2;HGNC:12363;tuberous sclerosis;MONDO:0001734;AD;Definitive;All P and LP
+TTN;HGNC:12403;dilated cardiomyopathy;MONDO:0005021;AD;Definitive;P and LP (truncating variants only)
+TTR;HGNC:12405;hereditary ATTR amyloidosis;MONDO:0017132;AD;Definitive;All P and LP
+VHL;HGNC:12687;von Hippel-Lindau disease;MONDO:0008667;AD;Definitive;All P and LP
+WT1;HGNC:12796;Wilms tumor 1;MONDO:0008679;AD;Definitive;All P and LP
