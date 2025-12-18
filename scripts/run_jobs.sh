@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+# Создаем заголовок VCF
 cat > header.vcf << 'EOF'
 ##fileformat=VCFv4.2
 ##source=SQLiteExport
@@ -15,6 +16,7 @@ cat > header.vcf << 'EOF'
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">
 ##FORMAT=<ID=GQ,Number=1,Type=Float,Description="Genotype Quality">
 ##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic Depths">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele Fraction">
 ##contig=<ID=chr1,length=248956422>
 ##contig=<ID=chr2,length=242193529>
 ##contig=<ID=chr3,length=198295559>
@@ -59,46 +61,71 @@ extract_all_variants() {
     fi
     
     # === AUTO-DETECT COLUMNS ===
-    # Get column names from vcf
-    local cols=$(sqlite3 "$db" "PRAGMA table_info(vcf);")
-    
-    # 1. Gene (might be Gene, gene or none)
-    local c_gene="''" # по умолчанию пустая строка SQL
+    local cols=$(sqlite3 "$db" "PRAGMA table_info(vcf);")    
+    # 1. Info: Gene
+    local c_gene="''"
     if echo "$cols" | grep -q "|Gene|"; then c_gene="Gene";
     elif echo "$cols" | grep -q "|gene|"; then c_gene="gene"; fi
     
-    # 2. HGVSc
+    # 2. Info: HGVSc
     local c_c="''"
     if echo "$cols" | grep -q "|HGVSc|"; then c_c="HGVSc";
     elif echo "$cols" | grep -q "|hgvsc|"; then c_c="hgvsc"; fi
     
-    # 3. HGVSp
+    # 3. Info: HGVSp
     local c_p="''"
     if echo "$cols" | grep -q "|HGVSp|"; then c_p="HGVSp";
     elif echo "$cols" | grep -q "|hgvsp|"; then c_p="hgvsp"; fi
+
+    # --- ОПРЕДЕЛЕНИЕ РЕАЛЬНЫХ ДАННЫХ ГЕНОТИПА ---
     
-    echo ">> $desc -> $out_vcf (detected: $c_gene, $c_c, $c_p)"
+    # 4. GT (Genotype)
+    local c_gt="'./.'"
+    if echo "$cols" | grep -q "|GT|"; then c_gt="GT"; fi
+
+    # 5. DP (Depth)
+    local c_dp="'.'"
+    if echo "$cols" | grep -q "|DP|"; then c_dp="DP"; fi
+
+    # 6. GQ (Genotype Quality)
+    local c_gq="'.'"
+    if echo "$cols" | grep -q "|GQ|"; then c_gq="GQ"; fi
+    
+    # 7. AF
+    local c_ad="'.,.'"
+    local c_af="'.'"
+    
+    if echo "$cols" | grep -q "|AD|"; then 
+        c_ad="AD"
+        # If AD exists, try to calculate AF from it if not present? 
+        # SQLite split is hard, assume caller provided AF if they provided AD.
+    elif echo "$cols" | grep -q "|RO|" && echo "$cols" | grep -q "|AO|"; then
+        # Build AD from RO,AO
+        c_ad="RO || ',' || AO"
+        
+        # Calculate AF = AO / (RO + AO)
+        # Check for division by zero
+        c_af="CASE WHEN (RO + AO) > 0 THEN CAST(AO AS FLOAT) / (RO + AO) ELSE 0.0 END"
+    fi
+    
+    # If explicit AF column exists, use it override
+    if echo "$cols" | grep -q "|AF|"; then c_af="AF"; fi
+
+    echo ">> $desc -> $out_vcf (detected Info: $c_gene, $c_c; Genotype: $c_gt, $c_dp, $c_ad, $c_af)"
     
     local temp_vcf="${out_vcf}_temp"
     
-    # Using $c_gene, $c_c и т.д. в запросе
+    # Added AF to FORMAT string and value list
     sqlite3 -separator $'\t' "$db" "
 SELECT 
     CHROM, POS, vid as ID, REF, ALT, 
     COALESCE(QUAL, 50), COALESCE(FILTER, 'PASS'), 
     'GENE=' || COALESCE($c_gene, '') || ';HGVSc=' || COALESCE($c_c, '') || ';HGVSp=' || COALESCE($c_p, '') as INFO,
-    'GT:DP:GQ:AD' as FORMAT,
-    CASE (abs(random()) % 100)
-        WHEN 0 THEN '0/0:35:99:35,0'
-        WHEN 1 THEN '0/0:40:99:40,0'
-        WHEN 2 THEN '1/1:25:80:0,25'
-        WHEN 3 THEN '1/1:30:85:0,30'
-        ELSE '0/1:28:90:14,14'
-    END as Sample
+    'GT:DP:GQ:AD:AF' as FORMAT,
+    COALESCE($c_gt, './.') || ':' || COALESCE($c_dp, '.') || ':' || COALESCE($c_gq, '.') || ':' || COALESCE($c_ad, '.,.') || ':' || COALESCE($c_af, '0.0') as Sample
 FROM vcf;" > "$temp_vcf"
     
     cat header.vcf > "$out_vcf"
-    # Sort numeric/version logic
     sort -k1,1V -k2,2n "$temp_vcf" >> "$out_vcf"
     rm -f "$temp_vcf"
 }
