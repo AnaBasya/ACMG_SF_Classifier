@@ -1,0 +1,17 @@
+{
+  "timestamp": "2025-12-24T19:36:52Z",
+  "proband_vcf": "./data/result.vcf.gz",
+  "annotated_vcf": "./all_ngs_results/result.dbnsfp.vep.vcf.gz",
+  "candidates_pre_qc": 0,
+  "candidates_post_qc": 0,
+  "dropped_pre_qc": 0,
+  "outputs": {
+    "all": "./all_ngs_results/all_candidates.csv",
+    "auto": "./all_ngs_results/auto_conclusions.csv",
+    "manual": "./all_ngs_results/manual_review_list.csv"
+  },
+  "counts": {
+    "auto": 0,
+    "manual": 0
+  }
+}

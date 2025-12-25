@@ -1,14 +1,18 @@
+import os
 import pandas as pd
 import sys
-import os
 
 # === SETTINGS ===
-INPUT_TABLE_PATH = "./data/input_list.tsv"       
-SCI_CSV_PATH = "./data/sci-fullset.csv"   
-STATUS_CSV_PATH = "./data/status.csv"     
-# Using os.path.expanduser to correctly handle the tilde symbol in Python
-BASE_DIR = os.path.expanduser("~/ngs-data/smk/GENOMES/BTK/") 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_TABLE_PATH = os.path.join(SCRIPT_DIR, "input_list.tsv")
+SCI_CSV_PATH = os.path.join(SCRIPT_DIR, "data/sci-fullset.csv")
+STATUS_CSV_PATH = os.path.join(SCRIPT_DIR, "data/status.csv")
+BASE_DIR = os.path.expanduser("~/ngs-data/smk/GENOMES/BTK/")
 OUTPUT_SCRIPT = "run_jobs.sh"
+
+print(f"Script directory: {SCRIPT_DIR}")
+print(f"Input file: {INPUT_TABLE_PATH}")
+print(f"File exists: {os.path.exists(INPUT_TABLE_PATH)}")
 
 # --- Functions ---
 
@@ -78,7 +82,7 @@ def load_data():
     """Loads CSV/TSV data into DataFrames."""
     try:
         # fillna("") is important for groupby operations later
-        df_inp = pd.read_csv(INPUT_TABLE_PATH, sep='\t', dtype=str).fillna("")
+        df_inp = pd.read_csv(INPUT_TABLE_PATH, sep='\t', dtype=str, engine='python', on_bad_lines='warn').fillna("")
     except:
         print(f"CRITICAL: File not found: {INPUT_TABLE_PATH}"); sys.exit(1)
 
@@ -262,6 +266,7 @@ def main():
     input_ids_all = set([clean_id(x) for x in inp['ДНК'].tolist() if str(x).strip()])
     print("-" * 40)
     print(f"Samples requested: {len(input_ids_all)}")
+    print("Missing samples:", input_ids_all - found_ids_set)
     print(f"Verified paths found: {len(unique_cmds)} (includes family members if trio)")
     print(f"Script created: {OUTPUT_SCRIPT}")
 
