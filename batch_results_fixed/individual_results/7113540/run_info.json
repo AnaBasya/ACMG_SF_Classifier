@@ -1,0 +1,17 @@
+{
+  "timestamp": "2025-12-25T12:27:08Z",
+  "proband_vcf": "./data/data_batch/3340_2022/7113540_sample.vcf",
+  "annotated_vcf": "./batch_results_fixed/individual_results/7113540/7113540_sample.acmg_only.dbnsfp.vep.vcf.gz",
+  "candidates_pre_qc": 753,
+  "candidates_post_qc": 629,
+  "dropped_pre_qc": 124,
+  "outputs": {
+    "all": "./batch_results_fixed/individual_results/7113540/all_candidates.csv",
+    "auto": "./batch_results_fixed/individual_results/7113540/auto_conclusions.csv",
+    "manual": "./batch_results_fixed/individual_results/7113540/manual_review_list.csv"
+  },
+  "counts": {
+    "auto": 0,
+    "manual": 0
+  }
+}
