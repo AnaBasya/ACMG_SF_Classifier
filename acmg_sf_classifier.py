@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACMG Secondary Findings Classifier - Ready-to-run
+ACMG Secondary Findings Classifier 
 
-This script:
-- Annotates (optionally) with VEP + dbNSFP
-- Integrates ClinVar, HGMD and Internal DB evidence
-- Applies gene-specific rules from ACMG SF table (with positional rules parsing)
-- Implements PVS1 decision tree, PS1/PM5, PP3/BP4, PM3 batch, TTN meta-exon support
-- Adds delins adjacency detection and transcript-position enforcement per recommendations table
-- CADD_SUPPORTING threshold set to 30
+Purpose:
+  Automates ACMG Secondary Findings (SF v3.x) classification for single samples or cohorts.
+  Annotates (optional VEP + dbNSFP), aggregates ClinVar/HGMD/internal and gnomAD evidence,
+  applies gene-specific ACMG SF rules (including transcript-aware PVS1/NMD logic),
+  evaluates PS1/PM5, PM3 batching (phasing-aware), delins detection, and triages results
+  into automatic reports and manual-review lists.
 
-Dependencies:
-  pandas, pysam, cyvcf2 (optional), intervaltree (optional), tabix/bcftools/bgzip for some operations
+Inputs:
+  - Proband VCF (optionally father/mother VCFs), ACMG SF table (CSV/TSV),
+    optional: dbNSFP, ClinVar VCF, HGMD CSV, internal DB CSV, gnomAD v2/v3/v4, exons/NMD/transcript maps.
 
-Usage: see CLI at bottom (run with --help)
+Outputs:
+  - all_candidates.csv, auto_conclusions.csv, manual_review_list.csv, run_info.json
 
-Author: adapted for user's dataset and requested positional checks
+Usage hint:
+  Run `python3 acmg_sf_classifier.py --help` for full CLI options and recommended workflows.
+
+Author: 
+  Clinical Bioinformatics Team of the Research Centre for Medical Genetics (Code by Anna Basova)
 """
+
 from __future__ import annotations
 from urllib.parse import unquote
 import os
@@ -35,6 +41,7 @@ import sqlite3
 import glob
 import concurrent.futures
 import csv
+import ast 
 from dataclasses import dataclass, field
 from typing import Tuple, List, Dict, Any, Optional, Set
 from collections import defaultdict
@@ -175,7 +182,7 @@ MIN_BENIGN_CRITERIA = 2
 LOF_CONSEQUENCES = {"stop_gained", "frameshift_variant", "frameshift", "splice_acceptor_variant", "splice_donor_variant", "start_lost"}
 CANONICAL_SPLICE = {"splice_acceptor_variant", "splice_donor_variant"}
 STRICT_QC_ENABLED = True
-STRICT_MIN_DP = 15
+STRICT_MIN_DP = 10
 STRICT_MIN_AF = 0.20
 
 # ---------------------------
@@ -402,6 +409,272 @@ def parse_protein_pos(hgvsp: str) -> Optional[int]:
         except Exception:
             return None
     return None
+
+# --- Helpers: parse cDNA pos from HGVSc and map cDNA position -> exon number using nmd_map / tx_map ---
+def parse_cdna_from_hgvsc(hgvsc: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Parse cDNA coordinate from an HGVSc string.
+    Examples:
+      "ENST00000258415.9:c.646+1G>T" -> returns (646, +1)
+      "c.123-2A>G" -> returns (123, -2)
+      "c.876A>T" -> returns (876, None)
+    Returns (cdna_pos, intronic_offset) where intronic_offset is None if absent,
+    else a signed int (+N or -N).
+    """
+    if not hgvsc:
+        return None, None
+    s = str(hgvsc).strip()
+    # If there is an ENST: prefix, split on ":"
+    if ":" in s:
+        parts = s.split(":")
+        # find the part that starts with c.
+        found = None
+        for p in parts[::-1]:
+            if p.startswith("c.") or p.startswith("C."):
+                found = p
+                break
+        if not found:
+            # fallback to entire string
+            found = parts[-1]
+    else:
+        found = s
+
+    # Now parse patterns like c.646+1, c.123-2, c.876
+    m = re.search(r'c\.(\d+)(?:([+-])(\d+))?', found, flags=re.I)
+    if not m:
+        return None, None
+    try:
+        cdna_pos = int(m.group(1))
+    except Exception:
+        cdna_pos = None
+    intr = None
+    if m.group(2) and m.group(3):
+        try:
+            sign = 1 if m.group(2) == '+' else -1
+            intr = sign * int(m.group(3))
+        except Exception:
+            intr = None
+    return cdna_pos, intr
+
+def map_cdna_to_exon_number(transcript: str,
+                            cdna_pos: Optional[int],
+                            nmd_map: Dict[str, Dict[str, Any]],
+                            tx_map: Optional[Dict[str, Any]] = None,
+                            intronic_offset: Optional[int] = None
+                            ) -> Optional[int]:
+    """
+    Map cDNA coordinate (cdna_pos) to an exon number using nmd_map.
+    Accepts optional intronic_offset (signed int) from HGVSc (e.g., +1, -2).
+    Improvements:
+     - If cds_exon_length missing, try to infer exon cds length from genomic_start/genomic_end when available.
+     - If intronic_offset provided, interpret c.(N)+k / c.(N)-k as adjacent exon boundaries:
+         * For +k (intronic after cdna_pos) prefer the exon whose cumulative end == cdna_pos
+         * For -k (intronic before cdna_pos) prefer exon whose cumulative start == cdna_pos+1
+    Returns exon_number or None.
+    """
+    if not cdna_pos or cdna_pos <= 0:
+        return None
+    if not nmd_map:
+        return None
+
+    def try_map_on_entry(entry: Dict[str, Any]) -> Optional[int]:
+        exs = entry.get("exons", []) or []
+        cumulative = 0
+        # build list of exon lengths, but if cds_exon_length missing use genomic coords fallback
+        exon_entries = []
+        for e in exs:
+            # attempt to get cds_exon_length
+            clen = None
+            try:
+                clen = e.get("cds_exon_length") or e.get("cds_length") or e.get("cds_length_exon")
+                if clen is not None:
+                    clen = int(clen)
+                    if clen <= 0:
+                        clen = None
+            except Exception:
+                clen = None
+
+            # fallback: compute from genomic coords if both present
+            if clen is None:
+                try:
+                    gs = e.get("genomic_start") or e.get("genomicStart") or e.get("start")
+                    ge = e.get("genomic_end") or e.get("genomicEnd") or e.get("end")
+                    if gs is not None and ge is not None:
+                        gs_i = int(gs); ge_i = int(ge)
+                        # approximate exon length (genomic) as coding length only if exon is coding — best-effort
+                        clen = abs(ge_i - gs_i) + 1
+                except Exception:
+                    clen = None
+
+            exon_entries.append({"exon_number": e.get("exon_number"), "cds_exon_length": clen,
+                                 "genomic_start": e.get("genomic_start"), "genomic_end": e.get("genomic_end")})
+
+        # If any exon still lacks length, we will attempt ordinal mapping by order
+        # Now accumulate
+        cumulative = 0
+        for e in exon_entries:
+            clen = e.get("cds_exon_length") or 0
+            # if we do not have a reliable cds_exon_length for this exon, mark and break to fallback to order-based mapping
+            if clen <= 0:
+                cumulative = None
+                break
+            prev = cumulative
+            cumulative += int(clen)
+            # direct hit for a coding base inside this exon
+            if prev < cdna_pos <= cumulative:
+                try:
+                    return int(e.get("exon_number")) if e.get("exon_number") is not None else None
+                except Exception:
+                    return None
+
+        # If we couldn't map by cds_exon_length, attempt ordinal mapping using genomic coordinates if present:
+        if cumulative is None:
+            # try to find an exon whose genomic interval contains the variant genomic position —
+            # but we do not have genomic variant position here; caller may handle that fallback.
+            # Try to use approximate logic: if intronic_offset present, interpret cdna boundary:
+            # For intronic offsets, prefer the exon at the boundary:
+            if intronic_offset is not None:
+                # For +N (intronic after cdna_pos) the exon with cumulative end == cdna_pos is the donor exon.
+                # For -N (intronic before cdna_pos) the exon with cumulative start == cdna_pos is acceptor exon.
+                # We'll attempt a best-effort by scanning exon_entries and using cumulative counts inferred from exon order if possible.
+                running = 0
+                for e in exon_entries:
+                    clen = e.get("cds_exon_length")
+                    # when length missing, try genomic length fallback
+                    if not clen:
+                        try:
+                            gs = e.get("genomic_start"); ge = e.get("genomic_end")
+                            if gs is not None and ge is not None:
+                                clen = abs(int(ge) - int(gs)) + 1
+                            else:
+                                # cannot compute further
+                                clen = None
+                        except Exception:
+                            clen = None
+                    if not clen:
+                        # skip if unable to derive
+                        continue
+                    prev = running
+                    running += int(clen)
+                    if intronic_offset > 0:
+                        # donor side: if this exon ends at cdna_pos (running == cdna_pos) -> choose it
+                        if running == cdna_pos:
+                            try:
+                                return int(e.get("exon_number")) if e.get("exon_number") is not None else None
+                            except Exception:
+                                return None
+                    else:
+                        # intronic_offset < 0: acceptor side — check if prev+1 == cdna_pos
+                        if prev + 1 == cdna_pos:
+                            try:
+                                return int(e.get("exon_number")) if e.get("exon_number") is not None else None
+                            except Exception:
+                                return None
+            # nothing reliable
+            return None
+
+        return None  # fallback if nothing matched
+
+    # 1) direct transcript key attempts
+    tx_candidates = []
+    if transcript:
+        tx_full = transcript.strip()
+        tx_base = tx_full.split(".")[0] if "." in tx_full else tx_full
+        tx_candidates.append(tx_full)
+        tx_candidates.append(tx_base)
+
+    for key in list(nmd_map.keys()):
+        if tx_candidates and key in tx_candidates:
+            res = try_map_on_entry(nmd_map[key])
+            if res:
+                return res
+
+    # 2) if transcript is Ensembl (ENST), try to map to RefSeq via tx_map
+    if tx_map and isinstance(tx_map, dict):
+        enst_key = transcript.split(".")[0] if transcript else None
+        if enst_key:
+            try:
+                refseqs = tx_map.get("ensembl_to_refseq", {}).get(enst_key) or tx_map.get("ensembl_to_refseq", {}).get(transcript)
+                if refseqs:
+                    for nm in refseqs:
+                        if nm in nmd_map:
+                            res = try_map_on_entry(nmd_map[nm])
+                            if res:
+                                return res
+            except Exception:
+                pass
+
+    # 3) try to match by transcript base (no version) heuristically
+    tx_base = transcript.split(".")[0] if transcript else None
+    if tx_base:
+        for k in nmd_map.keys():
+            if k.split(".")[0] == tx_base:
+                res = try_map_on_entry(nmd_map[k])
+                if res:
+                    return res
+
+    # Could not map
+    return None
+
+
+# --- precise canonical splice-site check (+/-1-2 nt) ---
+def _is_canonical_splice_site(vr: VariantRecord) -> bool:
+    """
+    Return True only when:
+      - the consequence indicates splice_acceptor/splice_donor
+    AND
+      - the variant is located in canonical splice positions (offset +1, +2, -1, -2 relative to exon/intron boundary).
+
+    Logic:
+      1) Prefer HGVSc parsing (patterns like "c.123+1A>T" or "c.123-2A>G") and accept offsets 1 or 2.
+      2) If HGVSc not available, try VEP DISTANCE annotation (distance to feature boundary). Accept abs(distance) <= 2.
+      3) Treat broad annotations like "splice_donor_5_base_variant" or "splice_region_variant" as non-canonical.
+      4) Fallback: if consequence exactly equals 'splice_donor_variant' or 'splice_acceptor_variant'
+         and no broad markers are present, consider canonical.
+    """
+    cons = (getattr(vr, "consequence", "") or "").lower()
+    if not cons:
+        return False
+
+    # Only consider splice consequences
+    if not any(tok in cons for tok in ("splice_acceptor", "splice_donor")):
+        return False
+
+    # 1) Try to extract offset from HGVSc (e.g., c.123+1 or c.123-2)
+    hgvsc = str(getattr(vr, "hgvsc", "") or "")
+    if hgvsc:
+        m = re.search(r'c\.[^\s:+-]*([+-])(\d+)', hgvsc)
+        if m:
+            try:
+                offset = int(m.group(2))
+                # canonical offsets are 1 or 2
+                return offset in (1, 2)
+            except Exception:
+                pass
+
+    # 2) Try VEP DISTANCE field if present in _raw_ann
+    try:
+        ann = getattr(vr, "_raw_ann", {}) or {}
+        dist_val = ann.get("DISTANCE") or ann.get("distance") or ann.get("Distance")
+        if dist_val is not None and dist_val != "":
+            try:
+                d = int(str(dist_val))
+                # canonical if absolute distance <= 2
+                return abs(d) <= 2
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3) If consequence contains explicit broad markers (5bp / 5_prime / splice_region), treat as non-canonical
+    if any(marker in cons for marker in ("5_base", "5base", "5_prime", "5prime", "5_bp", "5bp", "splice_region")):
+        return False
+
+    # 4) Last resort: if exact token indicates canonical splice variant and no broad markers were found, accept
+    if "splice_donor_variant" in cons or "splice_acceptor_variant" in cons:
+        return True
+
+    return False
 
 # ---------------------------
 # CSQ header and parser (robust)
@@ -2125,12 +2398,94 @@ def variant_triggers_nmd(vr: Any,
             last_start = int(last_exon.get("genomic_start"))
             last_end = int(last_exon.get("genomic_end"))
 
-            # variant in last exon -> escapes NMD
+            # Variant in last exon -> escapes NMD
             if last_start <= pos <= last_end:
                 tx_result["predicts_nmd"] = False
                 tx_result["details"]["reason"] = "variant_in_last_exon"
                 per_tx_results.append(tx_result)
                 continue
+
+            # ----------------------------
+            # Splice-site aware exon-number inference using HGVSc c. position (preferred),
+            # falling back to genomic-proximity inference if needed.
+            # ----------------------------
+            exon_num = None
+
+            # 0) Try to parse cDNA coordinate from HGVSc and map to exon number using nmd_map (preferred)
+            try:
+                hgvsc_raw = getattr(vr, "hgvsc", "") or ""
+                cdna_pos, intronic_offset = parse_cdna_from_hgvsc(hgvsc_raw)
+                if cdna_pos is not None:
+                    # Use nmd_map (if available) and tx_map (if provided) to map cdna_pos -> exon_number
+                    try:
+                        exon_from_cdna = None
+                        if nmd_map:
+                            # transcript id may be vr.transcript or info in _raw_ann Feature
+                            tx_id = getattr(vr, "transcript", "") or (vr._raw_ann.get("Feature") if getattr(vr,"_raw_ann",None) else "")
+                            exon_from_cdna = map_cdna_to_exon_number(tx_id, cdna_pos, nmd_map, tx_map, intronic_offset=intronic_offset)
+                        if exon_from_cdna:
+                            exon_num = exon_from_cdna
+                        else:
+                            logger.debug("cdna->exon mapping failed for %s (transcript=%s, cdna=%s, intr=%s). nmd_map keys: %d. exons_map present: %s",
+                                        getattr(vr, "hgvsp", "?"), tx_id, cdna_pos, intronic_offset, len(nmd_map) if nmd_map else 0, isinstance(exons_map, pd.DataFrame))
+                    except Exception:
+                        exon_num = None
+            except Exception:
+                exon_num = None
+
+            # 1) If exon_num still unknown, try VEP EXON field like "3/8"
+            if exon_num is None:
+                try:
+                    exon_field = getattr(vr, "exon", "") or ""
+                    if exon_field:
+                        m_ex = re.search(r'(\d+)\s*/\s*(\d+)', str(exon_field))
+                        if m_ex:
+                            try:
+                                exon_num = int(m_ex.group(1))
+                            except Exception:
+                                exon_num = None
+                except Exception:
+                    exon_num = None
+
+            # 2) Fallback: infer exon by genomic proximity using exons_list (if available)
+            if exon_num is None and exons_list:
+                for e in exons_list:
+                    try:
+                        en = e.get("exon_number")
+                        gs = e.get("genomic_start")
+                        ge = e.get("genomic_end")
+                        if en is None or gs is None or ge is None:
+                            continue
+                        # donor site (intronic after exon end)
+                        if pos > ge and pos <= ge + 10:
+                            exon_num = int(en)
+                            break
+                        # acceptor site (intronic before exon start)
+                        if pos < gs and pos >= gs - 10:
+                            exon_num = int(en)
+                            break
+                        # inside exon
+                        if gs <= pos <= ge:
+                            exon_num = int(en)
+                            break
+                    except Exception:
+                        continue
+
+            # 3) If this is a splice consequence and we inferred exon_num, check last/penultimate exon
+            cons_lower = (getattr(vr, "consequence", "") or "").lower()
+            if any(tok in cons_lower for tok in ("splice_acceptor", "splice_donor", "splice_region")):
+                try:
+                    last_exon_number = int(last_exon.get("exon_number")) if last_exon and last_exon.get("exon_number") is not None else None
+                    if exon_num is not None and last_exon_number is not None:
+                        # treat splice-sites in last exon and penultimate exon as escaping NMD
+                        if exon_num == last_exon_number or exon_num == (last_exon_number - 1):
+                            tx_result["predicts_nmd"] = False
+                            tx_result["details"]["reason"] = f"splice_site_in_last_or_penultimate_exon (exon={exon_num})"
+                            per_tx_results.append(tx_result)
+                            continue
+                except Exception:
+                    # if specialist logic fails, fall back to general logic below
+                    pass
 
             # find penultimate CDS exon coordinates
             pen_ex = None
@@ -2496,7 +2851,8 @@ class ACMGEngine:
         special = self._get_gene_rule(vr.gene).get("special_flags", {}) if self.gene_rules else {}
         # support both older/short and VEP-style consequence tokens
         is_lof_molecular = any(x in cons for x in ["stop_gained", "frameshift", "frameshift_variant", "start_lost", "stop_lost"])
-        is_canonical_splice = any(x in cons for x in ["splice_acceptor_variant", "splice_donor_variant", "splice_acceptor", "splice_donor"])
+        # Determine canonical splice only for true canonical positions (+/-1-2 nt) using helper
+        is_canonical_splice = _is_canonical_splice_site(vr)
         logger.debug(f"PVS1 check for {vr.gene}:{vr.hgvsp} - Consequence: {cons}")
         logger.debug(f"  is_lof_molecular: {is_lof_molecular}")
         logger.debug(f"  is_canonical_splice: {is_canonical_splice}")
@@ -2581,7 +2937,7 @@ class ACMGEngine:
                     # Triggers NMD -> PVS1_VeryStrong
                     assigned.append("PVS1_VeryStrong")
                     pts["PVS1_VeryStrong"] = POINTS_MAP.get("PVS1_VeryStrong", 8)
-                    vr.criteria_explanations["PVS1"] = ("PVS1_VeryStrong: ... predicted NMD")
+                    vr.criteria_explanations["PVS1"] = ("PVS1_VeryStrong: Variant is a predicted loss-of-function event and is predicted to trigger NMD")
                 else:
                     # Escapes NMD => DO NOT assign PVS1. For truncating variants in last exon, use PM4 instead.
                     # For canonical splice variants in last exon, treat conservatively as PM4_Moderate
@@ -2789,7 +3145,7 @@ class ACMGEngine:
             vr.criteria_explanations["PP5"] = "PP5_Supporting: high-quality database annotation (ClinVar≥2★ or HGMD DM≥2 pubs or Internal DB P/LP)"
 
         # -------------------------
-        # Final scoring & class assignment (Tavtigian points model)
+        # Final scoring & class assignment (Tavtigian et al., (2018) points model)
         # -------------------------
         total = sum(pts.values())
         path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS","PS","PM","PP"]))
@@ -3021,22 +3377,29 @@ def deduplicate_candidates(candidates: List[VariantRecord]) -> List[VariantRecor
 # ---------------------------
 def detect_delins(candidates: List[VariantRecord]) -> None:
     """
-    Improved delins detection by interval overlap / clustering.
+    Detect potential delins (complex adjacent indels) by clustering variants
+    that are on the same chromosome, in the same sample, and within 10 bp of each other.
 
-    For each sample and chromosome:
-      - compute genomic span for variant as [pos, pos + max(len(ref), len(alt)) - 1]
-      - consider two variants overlapping if spans intersect
-      - build connected components (clusters) of overlapping variants
-      - for each cluster of size >= 2, mark variants with _delins_flag, assign _delins_cluster_id
-        and store cluster member keys (for later triage decision).
-      - add an informational manual_reasons note describing the cluster membership (so it will
-        appear in 'comments' for auto variants).
+    Phasing rules (based on proband GT):
+      - If two variants have phased GTs (use '|' separator) and the alternate allele is on the same haplotype index
+        (e.g. both are '0|1' or both '1|0' -> same index), they are considered in cis -> cluster marked as delins.
+      - If phased and on opposite haplotype indices -> trans (do not mark as delins; add note).
+      - If GTs are not phased for the cluster -> mark cluster as unphased-delins (manual review / phasing required).
+
+    This function mutates VariantRecord objects to add:
+      - _delins_flag (bool)
+      - _delins_cluster_id (int or None)
+      - _delins_cluster_members (list of keys)
+      - is_delins_part (bool)
+      - manual_reasons appended with human-readable notes
     """
-    # helper: build key
+    from collections import defaultdict
+
+    # helper: stable key for a variant
     def key_of(v: VariantRecord) -> str:
         return f"{v.chrom}:{v.pos}:{v.ref}:{v.alt}:{v.sample}"
 
-    # organize by sample and chromosome to avoid cross-sample/cross-chrom checks
+    # Organize variants by sample and chromosome (we only consider same-sample, same-chromosome clusters)
     by_sample_chr = defaultdict(lambda: defaultdict(list))
     for v in candidates:
         try:
@@ -3046,89 +3409,194 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
         except Exception:
             continue
 
-    cluster_counter = 0
-    # clear previous cluster metadata if present
+    # Initialize/clear any previous delins metadata
     for v in candidates:
-        if hasattr(v, "_delins_flag"):
-            delattr(v, "_delins_flag")
+        # ensure lists exist
+        if not hasattr(v, "manual_reasons") or v.manual_reasons is None:
+            v.manual_reasons = []
         v._delins_flag = False
         v._delins_cluster_id = None
         v._delins_cluster_members = []
+        v.is_delins_part = False
 
+    cluster_counter = 0
+
+    # Helper: parse phased haplotype index for proband GT
+    def _phased_hap_index(gt: str) -> Optional[int]:
+        """
+        Return haplotype index (0 or 1) where the ALT allele '1' is located if GT is phased and exactly one '1' present.
+        Return None if not phased or ambiguous (e.g. '1|1' or missing).
+        Examples:
+          '0|1' -> 1
+          '1|0' -> 0
+          '0/1' -> None (unphased)
+          './.' -> None
+        """
+        if not gt or '|' not in gt:
+            return None
+        parts = gt.split('|')
+        # protect against unusual genotype tokens and multi-allelic formats
+        try:
+            # Count occurrences of '1' (ALT) only once => determine its index
+            count_ones = parts.count('1')
+            if count_ones == 1:
+                return parts.index('1')
+            # if exactly one allele equals '1' but not literal '1' string (e.g. int types), handle robustly
+            # fallback: try to coerce to strings and compare
+            for idx, p in enumerate(parts):
+                if str(p) == '1':
+                    return idx
+        except Exception:
+            return None
+        return None
+
+    # For each sample/chromosome, build adjacency graph for variants within 10 bp
     for sample, chrom_map in by_sample_chr.items():
         for chrom, varlist in chrom_map.items():
             n = len(varlist)
             if n < 2:
                 continue
-            # compute spans
-            spans = []
-            for v in varlist:
+
+            # Sort by position for efficient neighbor detection
+            varlist_sorted = sorted(varlist, key=lambda x: int(x.pos))
+
+            # interval-aware adjacency (replace the start-based adjacency scan)
+            def _span(v: VariantRecord):
                 try:
                     s = int(v.pos)
+                    rlen = len(v.ref) if v.ref is not None else 1
+                    e = s + max(1, int(rlen)) - 1
+                    return s, e
                 except Exception:
-                    s = 0
-                ref_len = len(v.ref or "")
-                alt_len = len(v.alt or "")
-                span_len = max(ref_len, alt_len, 1)
-                start = s
-                end = s + span_len - 1
-                spans.append((v, start, end))
-            # build adjacency graph where edges link overlapping spans
-            neighbors = {key_of(v): set() for v,_,_ in spans}
-            for i in range(len(spans)):
-                vi, si, ei = spans[i]
+                    return int(v.pos), int(v.pos)
+
+            # Precompute spans and initialize neighbors
+            spans = { key_of(vv): _span(vv) for vv in varlist_sorted }
+            neighbors = { key_of(vv): set() for vv in varlist_sorted }
+
+            # Two-pointer scan with interval-gap calculation
+            for i in range(len(varlist_sorted)):
+                vi = varlist_sorted[i]
                 ki = key_of(vi)
-                for j in range(i+1, len(spans)):
-                    vj, sj, ej = spans[j]
+                s_i, e_i = spans[ki]
+                j = i + 1
+                while j < len(varlist_sorted):
+                    vj = varlist_sorted[j]
                     kj = key_of(vj)
-                    # overlap test: intervals intersect if (si <= ej and sj <= ei)
-                    overlap = (si <= ej and sj <= ei)
-                    if overlap:
-                        neighbors[ki].add(kj)
-                        neighbors[kj].add(ki)
-            # find connected components (clusters) in adjacency graph
+                    s_j, e_j = spans[kj]
+                    # gap between intervals: 0 if overlapping/contiguous, else s_j - e_i - 1
+                    gap = 0 if s_j <= e_i else (s_j - e_i - 1)
+                    if gap > 10:  # adjacency threshold (10 bp)
+                        break
+                    # within threshold -> mark adjacency
+                    neighbors[ki].add(kj)
+                    neighbors[kj].add(ki)
+                    j += 1
+
+            # Find connected components (clusters) using BFS/DFS on adjacency graph
             visited = set()
-            for v_obj, s_v, e_v in spans:
-                k = key_of(v_obj)
-                if k in visited:
+            key_to_var = {key_of(vv): vv for vv in varlist_sorted}
+            for v_obj in varlist_sorted:
+                start_k = key_of(v_obj)
+                if start_k in visited:
                     continue
-                if not neighbors.get(k):
-                    visited.add(k)
+                if not neighbors.get(start_k):
+                    visited.add(start_k)
                     continue
-                # BFS to collect component
-                comp = []
-                queue = [k]
+
+                # BFS collect component
+                comp_keys = []
+                queue = [start_k]
                 while queue:
                     cur = queue.pop()
                     if cur in visited:
                         continue
                     visited.add(cur)
-                    comp.append(cur)
+                    comp_keys.append(cur)
                     for nb in neighbors.get(cur, set()):
                         if nb not in visited:
                             queue.append(nb)
-                if len(comp) < 2:
+
+                if len(comp_keys) < 2:
                     continue
-                # Assign a cluster id and annotate members
-                cluster_counter += 1
-                # Resolve keys -> VariantRecord objects for the component
+
+                # Map keys -> VariantRecord objects
                 comp_vars = []
-                key_to_var = {key_of(vv): vv for vv in varlist}
-                for kk in comp:
+                for kk in comp_keys:
                     vv = key_to_var.get(kk)
                     if vv:
                         comp_vars.append(vv)
-                # annotate each variant in cluster
-                member_str = ";".join(comp)
-                for vv in comp_vars:
-                    vv._delins_flag = True
-                    vv._delins_cluster_id = cluster_counter
-                    vv._delins_cluster_members = comp[:]  # list of keys
-                    note = f"Delins cluster detected (cluster_id={cluster_counter}, members={member_str}) - possible complex indel / delins adjacency"
-                    if note not in getattr(vv, "manual_reasons", []):
-                        if not hasattr(vv, "manual_reasons") or vv.manual_reasons is None:
-                            vv.manual_reasons = []
-                        vv.manual_reasons.append(note)
+
+                # Evaluate phasing across pairs in the component
+                any_phased = False
+                any_cis = False
+                any_trans = False
+                phasing_pairs = []  # store tuples (v1, v2, 'cis'/'trans')
+
+                for a_idx in range(len(comp_vars)):
+                    for b_idx in range(a_idx + 1, len(comp_vars)):
+                        a = comp_vars[a_idx]
+                        b = comp_vars[b_idx]
+                        # Only evaluate phasing if both variants belong to same sample (they do) and same chrom (they do)
+                        ai = _phased_hap_index(getattr(a, "proband_gt", ""))
+                        bi = _phased_hap_index(getattr(b, "proband_gt", ""))
+                        if ai is not None and bi is not None:
+                            any_phased = True
+                            if ai == bi:
+                                any_cis = True
+                                phasing_pairs.append((a, b, "cis"))
+                            else:
+                                any_trans = True
+                                phasing_pairs.append((a, b, "trans"))
+
+                # Decide cluster action:
+                cluster_counter += 1
+                member_str = ";".join(comp_keys)
+
+                if any_cis:
+                    # Confirmed cis evidence for at least one pair -> mark whole cluster as delins
+                    for vv in comp_vars:
+                        vv._delins_flag = True
+                        vv._delins_cluster_id = cluster_counter
+                        vv._delins_cluster_members = comp_keys.copy()
+                        vv.is_delins_part = True
+                        # add an informative manual reason
+                        pair_notes = []
+                        for (p1, p2, rel) in phasing_pairs:
+                            pair_notes.append(f"{p1.chrom}:{p1.pos}-{p2.chrom}:{p2.pos}:{rel}")
+                        note = (f"Delins cluster detected (cluster_id={cluster_counter}; members={member_str}); "
+                                f"phasing evidence: {', '.join(pair_notes)}")
+                        if note not in vv.manual_reasons:
+                            vv.manual_reasons.append(note)
+
+                elif any_phased and any_trans and not any_cis:
+                    # Phased pairs exist but only trans observed -> do NOT call delins;
+                    # add notes indicating trans phasing prevents delins interpretation.
+                    for vv in comp_vars:
+                        pair_notes = []
+                        for (p1, p2, rel) in phasing_pairs:
+                            pair_notes.append(f"{p1.chrom}:{p1.pos}-{p2.chrom}:{p2.pos}:{rel}")
+                        note = (f"Close variants (cluster_id={cluster_counter}; members={member_str}) are phased but observed in trans "
+                                f"(pairs: {', '.join(pair_notes)}). Not considered delins; phasing excludes delins.")
+                        if note not in vv.manual_reasons:
+                            vv.manual_reasons.append(note)
+                        # ensure we do not mark this as delins
+                        vv._delins_flag = False
+                        vv._delins_cluster_id = cluster_counter
+                        vv._delins_cluster_members = comp_keys.copy()
+                        vv.is_delins_part = False
+
+                else:
+                    # No useful phasing information -> mark as potential delins (unphased)
+                    for vv in comp_vars:
+                        vv._delins_flag = True
+                        vv._delins_cluster_id = cluster_counter
+                        vv._delins_cluster_members = comp_keys.copy()
+                        vv.is_delins_part = True
+                        note = (f"Delins cluster (unphased) detected (cluster_id={cluster_counter}; members={member_str}) - "
+                                "phasing required to confirm cis/trans.")
+                        if note not in vv.manual_reasons:
+                            vv.manual_reasons.append(note)
 
 # ---------------------------
 # Position rules loader & checker (from recommendations table)
@@ -3327,11 +3795,114 @@ def select_moi_for_variant(rule: Dict[str, Any], variant: VariantRecord) -> str:
 
     return moi_field
 
+def choose_disease_for_gene(rule: Dict[str, Any], variants: List[VariantRecord]) -> Tuple[str, str, str]:
+    """
+    From a gene-level rule that may contain multiple diseases and MOIs (semicolon/pipe-separated),
+    choose the most appropriate (disease, moi) tuple for this sample/gene based on the variants observed.
+
+    Logic:
+      - Parse `disease` and `moi` fields into parallel lists (split by ; / | / /).
+      - Count the number of P/LP variants in `variants` (automated_class in Pathogenic/Likely pathogenic).
+      - If exactly 1 P/LP variant -> prefer a disease whose MOI indicates dominant (contains 'AD' or 'DOMINANT').
+        If none found, fall back to first disease.
+      - If >= 2 P/LP heterozygous variants -> prefer a disease whose MOI indicates recessive (contains 'AR' or 'RECESSIVE').
+        If none found, fall back to first disease.
+      - If no P/LP found, return the first disease/moi (fallback).
+    Returns:
+      (selected_disease, selected_moi, reason)
+    """
+    if not rule:
+        return "", "", "no_rule"
+
+    disease_field = str(rule.get("disease", "") or "").strip()
+    moi_field = str(rule.get("moi", "") or "").strip()
+
+    # Split preserving order
+    def split_list(s: str) -> List[str]:
+        if not s:
+            return []
+        parts = [p.strip() for p in re.split(r'[;/\|]+', s) if p.strip()]
+        return parts
+
+    diseases = split_list(disease_field)
+    mois = split_list(moi_field)
+
+    # Pad mois to match diseases
+    if len(mois) < len(diseases):
+        mois = (mois + [""] * len(diseases))[:len(diseases)]
+    if not diseases:
+        return "", moi_field, "no_disease_list"
+
+    # Count P/LP variants in this sample/gene
+    plp_variants = [v for v in variants if getattr(v, "automated_class", "") in ("Pathogenic", "Likely pathogenic")]
+    plp_count = len(plp_variants)
+
+    # Helper to find index matching MOI tokens
+    def find_index_with_moi_token(tokens: List[str]) -> Optional[int]:
+        for i, m in enumerate(mois):
+            ml = (m or "").upper()
+            for t in tokens:
+                if t in ml:
+                    return i
+        return None
+
+    # Determine selection
+    selected_idx = None
+    reason = "fallback_first"
+
+    if plp_count == 1:
+        # prefer dominant disease
+        idx = find_index_with_moi_token(["AD", "AUTOSOMAL_DOMINANT", "DOMINANT"])
+        if idx is not None:
+            selected_idx = idx
+            reason = "single_plp_prefers_dominant"
+    elif plp_count >= 2:
+        # prefer recessive disease (AR)
+        idx = find_index_with_moi_token(["AR", "AUTOSOMAL_RECESSIVE", "RECESSIVE"])
+        if idx is not None:
+            selected_idx = idx
+            reason = "multi_plp_prefers_recessive"
+
+    # fallback heuristics
+    if selected_idx is None:
+        # try to pick a disease with explicit AD/AR depending on count
+        if plp_count == 1:
+            # choose first disease that looks AD-like by moi tokens among mois (looser match)
+            for i, m in enumerate(mois):
+                if any(tok in (m or "").upper() for tok in ("AD", "DOMINANT")):
+                    selected_idx = i; reason = "fallback_dominant_by_moi"
+                    break
+        elif plp_count >= 2:
+            for i, m in enumerate(mois):
+                if any(tok in (m or "").upper() for tok in ("AR", "RECESSIVE")):
+                    selected_idx = i; reason = "fallback_recessive_by_moi"
+                    break
+
+    if selected_idx is None:
+        # final fallback: pick first
+        selected_idx = 0
+        reason = reason if reason else "final_fallback_first"
+
+    selected_disease = diseases[selected_idx] if selected_idx < len(diseases) else diseases[0]
+    selected_moi = mois[selected_idx] if selected_idx < len(mois) else (mois[0] if mois else "")
+
+    return selected_disease, selected_moi, reason
+
 def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: str = "", recs_map: Dict = None) -> dict:
+    # disease from the ACMG rule (if provided)
     acmg_disease = rule.get("disease", "") if isinstance(rule, dict) else ""
+
+    # Special_Guidance should be "Yes" only when this gene has additional Rules
+    # in the ACMG table (e.g., rule['rules_text'] is present and non-empty).
+    # We prefer the per-gene rule entry (rule) passed into this function.
     has_guidance = "No"
-    if recs_map and v.gene in recs_map:
-        if recs_map[v.gene]: has_guidance = "Yes"
+    try:
+        if isinstance(rule, dict) and str(rule.get("rules_text", "") or "").strip():
+            has_guidance = "Yes"
+        else:
+            has_guidance = "No"
+    except Exception:
+        has_guidance = "No"
     # prepare various textual fields
     reasons = "; ".join(v.manual_reasons) if v.manual_reasons else ""
     clinvar_phen = v.clinvar_trait
@@ -3492,19 +4063,34 @@ def collapse_output_rows(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
                 cp_new = json.loads(cp_new)
         except Exception:
             cp_new = {}
-        for k,v in cp_new.items():
+        for k, v in cp_new.items():
+        # robustly parse incoming value to int
             try:
                 vi = int(v)
             except Exception:
-                try: vi = int(float(v))
-                except Exception: vi = 0
+                try:
+                    vi = int(float(v))
+                except Exception:
+                    vi = 0
+
             if k not in cp_existing:
                 cp_existing[k] = vi
             else:
                 try:
-                    cp_existing[k] = max(int(cp_existing.get(k,0)), vi)
+                    existing_val = int(cp_existing.get(k, 0))
                 except Exception:
-                    cp_existing[k] = vi
+                    try:
+                        existing_val = int(float(cp_existing.get(k, 0)))
+                    except Exception:
+                        existing_val = 0
+
+                # If either value is negative, keep the most negative (preserve penalty)
+                if existing_val < 0 or vi < 0:
+                    cp_existing[k] = min(existing_val, vi)
+                else:
+                    # both non-negative: keep the maximum (avoid double-counting of same criterion)
+                    cp_existing[k] = max(existing_val, vi)
+
         existing["criteria_points"] = cp_existing
         try:
             existing["total_points"] = int(sum(int(x) for x in existing["criteria_points"].values()))
@@ -3704,6 +4290,160 @@ def strict_triage_and_output(
         except Exception:
             pass
         return None
+    
+    # --- Helpers to parse & evaluate gene Rules column for a variant ---
+    def _split_rules_text(raw: Optional[str]) -> List[str]:
+        """Split raw Rules cell text into non-empty rule lines."""
+        if not raw:
+            return []
+        # Many cells may contain newlines or repeated identical lines; split by newline and keep non-empty
+        lines = []
+        for ln in re.split(r'[\r\n]+', str(raw)):
+            s = ln.strip()
+            if s:
+                lines.append(s)
+        return lines
+
+    def _evaluate_single_rule(rule: str, vr: VariantRecord) -> bool:
+        """
+        Return True if this single rule matches the variant (meaning it triggers the rule).
+        Supports patterns seen in ACMG_SF_v3.3.tsv:
+        - Include/Exclude if Impact is "MODERATE" or "LOW" (or unquoted)
+        - Exclude if Consequence contains "5_prime_UTR_variant"
+        - Include/Exclude if HGVSp contains "p.Cys282Tyr"
+        - Exclude if HGVSp contains any of: ["p.X","p.Y",...]
+        """
+        if not rule or not vr:
+            return False
+        r = rule.strip()
+
+        # --- Extract/derive IMPACT once ---
+        try:
+            ann = getattr(vr, "_raw_ann", {}) or {}
+            impact_val = str(ann.get("IMPACT") or ann.get("impact") or ann.get("Impact") or "").strip()
+        except Exception:
+            impact_val = ""
+        impact_val_up = impact_val.upper()
+
+        # If IMPACT absent, derive from consequence (best-effort)
+        if not impact_val_up:
+            cons = str(getattr(vr, "consequence", "") or "").lower()
+            if any(tok in cons for tok in ("stop_gained", "frameshift", "start_lost", "stop_lost", "splice_acceptor", "splice_donor")):
+                impact_val_up = "HIGH"
+            elif "missense" in cons or "inframe" in cons:
+                impact_val_up = "MODERATE"
+            elif "synonymous" in cons or "5_prime_utr_variant" in cons or "3_prime_utr_variant" in cons:
+                impact_val_up = "LOW"
+            else:
+                impact_val_up = ""
+
+        # --- 1) Impact rules (quoted or unquoted, possibly "or" combined) ---
+        m = re.search(r'impact\s+is\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_]+))(?:\s+or\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_]+)))?', r, flags=re.I)
+        if m:
+            toks = []
+            for g in (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)):
+                if g:
+                    toks.append(str(g).strip().upper())
+            if toks and impact_val_up:
+                for t in toks:
+                    if t and t in impact_val_up:
+                        return True
+            return False
+
+        # also support simple "Impact is MODERATE" without quotes (caught by above, but keep fallback)
+        m2 = re.search(r'\bimpact\s+is\s+([A-Za-z_]+)\b', r, flags=re.I)
+        if m2 and '"' not in r and "'" not in r:
+            desired = m2.group(1).strip().upper()
+            if desired and desired == impact_val_up:
+                return True
+
+        # --- 2) Consequence contains ... ---
+        m3 = re.search(r'consequence\s+contains\s*["\']?([^"\']+)["\']?', r, flags=re.I)
+        if m3:
+            want = m3.group(1).strip().lower()
+            cons = str(getattr(vr, "consequence", "") or "").lower()
+            if want and want in cons:
+                return True
+            return False
+
+        # --- 3) HGVSp contains "..." ---
+        m4 = re.search(r'hgvsp\s+contains\s*["\']([^"\']+)["\']', r, flags=re.I)
+        if m4:
+            want = m4.group(1).strip()
+            hgvsp = str(getattr(vr, "hgvsp", "") or "")
+            if want and want in hgvsp:
+                return True
+            return False
+
+        # --- 4) HGVSp contains any of: ["p.Arg...","p.X..."] ---
+        m5 = re.search(r'hgvsp\s+contains\s+any\s+of\s*:\s*(\[[^\]]+\])', r, flags=re.I)
+        if m5:
+            list_text = m5.group(1)
+            try:
+                arr = ast.literal_eval(list_text)
+                if isinstance(arr, (list, tuple)):
+                    hgvsp = str(getattr(vr, "hgvsp", "") or "")
+                    for item in arr:
+                        if item and str(item) in hgvsp:
+                            return True
+            except Exception:
+                # fallback: parse quoted substrings
+                items = re.findall(r'["\']([^"\']+)["\']', list_text)
+                hgvsp = str(getattr(vr, "hgvsp", "") or "")
+                for it in items:
+                    if it and it in hgvsp:
+                        return True
+            return False
+
+        # No known pattern matched
+        return False
+
+    def evaluate_gene_rules_for_variant(rules_text: Optional[str], vr: VariantRecord) -> Tuple[str, List[str]]:
+        """
+        Evaluate a block of rules (multi-line string) against variant vr.
+        Returns (decision, matched_rules_list) where decision is one of:
+        - "exclude"  : at least one Exclude rule matched
+        - "include"  : no Exclude matched, at least one Include matched
+        - "no_match" : no rule matched
+        The function identifies which specific rule lines triggered and returns them in matched_rules_list.
+        """
+        if not rules_text:
+            return "no_match", []
+
+        lines = _split_rules_text(rules_text)
+        matched_excludes = []
+        matched_includes = []
+
+        for line in lines:
+            line_strip = line.strip()
+            if not line_strip:
+                continue
+            # detect whether this is Include or Exclude rule
+            is_excl = bool(re.match(r'^\s*Exclude\s+if', line_strip, flags=re.I))
+            is_incl = bool(re.match(r'^\s*Include\s+if', line_strip, flags=re.I))
+
+            # Evaluate rule match
+            triggers = _evaluate_single_rule(line_strip, vr)
+            if triggers:
+                if is_excl:
+                    matched_excludes.append(line_strip)
+                elif is_incl:
+                    matched_includes.append(line_strip)
+                else:
+                    # If rule line doesn't start with Include/Exclude, try to interpret presence of 'Exclude' / 'Include' words
+                    if 'exclude' in line_strip.lower():
+                        matched_excludes.append(line_strip)
+                    elif 'include' in line_strip.lower():
+                        matched_includes.append(line_strip)
+                    else:
+                        # ambiguous default: treat as include if matched
+                        matched_includes.append(line_strip)
+
+        if matched_excludes:
+            return "exclude", matched_excludes
+        if matched_includes:
+            return "include", matched_includes
+        return "no_match", []
     
     def _db_high_quality_consensus(v: VariantRecord) -> Tuple[Optional[str], List[Dict[str,str]], bool, Optional[str]]:
         """
@@ -3930,11 +4670,279 @@ def strict_triage_and_output(
             if not varlist:
                 continue
 
+            # Load gene rule and recommendations for this gene
             rule = gene_rules.get(gene, {}) if gene_rules else {}
             spec_rules = recs_map.get(gene, {}) if recs_map else {}
-            moi = str(rule.get("moi","")).upper() if rule else ""
-            acmg_disease = rule.get("disease", "") if rule else ""
+
+            # Determine sample sex
             sample_sex = varlist[0].sample_sex if varlist and hasattr(varlist[0], "sample_sex") else "Unknown"
+
+            # Choose disease / MOI for this sample/gene based on variant counts
+            selected_disease, selected_moi, disease_choice_reason = choose_disease_for_gene(rule, varlist)
+
+            # Normalize selected MOI for later checks
+            moi = str(selected_moi or "").upper()
+            acmg_disease = selected_disease or str(rule.get("disease", "") or "")
+
+            # Store choice on variants for provenance and downstream logic (used later for AR-blocking etc.)
+            for v in varlist:
+                try:
+                    v._selected_acmg_disease = acmg_disease
+                    v._selected_moi = moi
+                    v._selected_disease_choice_reason = disease_choice_reason
+                except Exception:
+                    pass
+
+            # --- Normalise effective MOI for this sample/gene and apply single-het carrier suppression ---
+            try:
+                eff_moi = (moi or "").upper()
+            except Exception:
+                eff_moi = str(rule.get("moi", "") or "").upper()
+
+            # helper: check whether this gene/disease is recessive in effective MOI
+            eff_is_recessive = ("AR" in eff_moi) or ("RECESSIVE" in eff_moi)
+            # also treat explicit X-linked-recessive as recessive for carrier rules:
+            eff_is_recessive = eff_is_recessive or ("XLR" in eff_moi or "X-LINKED_RECESSIVE" in eff_moi or "X_LINKED_RECESSIVE" in eff_moi)
+
+            if eff_is_recessive:
+                # collect P/LP and VUS>=5 in this sample/gene
+                plp_vars = [vv for vv in varlist if getattr(vv, "automated_class", "") in ("Pathogenic", "Likely pathogenic")]
+                plp_hets = [vv for vv in plp_vars if _is_het(getattr(vv, "proband_gt", "./."))]
+                plp_homs_or_hemi = [vv for vv in plp_vars if _is_hom(getattr(vv, "proband_gt", "./.")) or (
+                    (getattr(vv, "sample_sex", "").lower() == "male")
+                    and (vv.chrom.upper().replace("CHR","") in ("X","Y"))
+                    and (sum(1 for a in re.split(r'[\/|]', str(getattr(vv, "proband_gt", "") or "")) if str(a) == "1") == 1)
+                )]
+                vus5 = [vv for vv in varlist if getattr(vv, "automated_class", "") == "VUS" and (getattr(vv, "total_points", 0) >= 5) and _is_het(getattr(vv, "proband_gt", "./."))]
+
+                # If there is exactly one heterozygous P/LP, NO homozygous/hemi P/LP, NO VUS>=5 partners and no other P/LP,
+                # treat whole set as carrier -> FILTER ALL (do not escalate to manual nor auto).
+                if len(plp_vars) == 1 and len(plp_hets) == 1 and len(plp_homs_or_hemi) == 0 and len(vus5) == 0:
+                    note = "Filtered: Recessive heterozygous carrier (single P/LP het with no qualifying partner) - not returned as secondary finding"
+                    for vv in varlist:
+                        vv._filtered = True
+                        vv._in_auto = False
+                        vv._in_manual = False
+                        if not hasattr(vv, "filtered_reasons") or vv.filtered_reasons is None:
+                            vv.filtered_reasons = []
+                        if note not in vv.filtered_reasons:
+                            vv.filtered_reasons.append(note)
+                    # skip further processing for this gene/sample
+                    continue
+
+            # --- AR-only handling with homo/hemizygote allowance and pairing/manual rules ---
+            # Use the effective MOI determined per-sample (eff_moi) 
+            moi_field_raw = (getattr(varlist[0], "_selected_moi", None) or moi or str(rule.get("moi", "") or "")).upper()
+            is_ar_flag = ("AR" in moi_field_raw) or ("RECESSIVE" in moi_field_raw) or ("XLR" in moi_field_raw)
+            has_dom_flag = any(tok in moi_field_raw for tok in ("AD", "DOMINANT", "AUTOSOMAL_DOMINANT", "XLD", "X_LINKED_DOMINANT"))
+            is_ar_only = bool(is_ar_flag and not has_dom_flag)
+
+            # helper: robust hemizygous detection (treat male X/Y single-alt as hemizygous)
+            def _is_hemizygous_variant(v: VariantRecord) -> bool:
+                gt = getattr(v, "proband_gt", "") or ""
+                # clear homozygous first
+                if _is_hom(gt):
+                    return True
+                # check genotypes like "1/." or "./1" or single-allele encodings
+                if "|" in gt or "/" in gt:
+                    parts = re.split(r'[\/|]', gt)
+                    try:
+                        # single alt allele present and other allele missing -> hemizygous-like
+                        if len(parts) == 2 and (parts.count("1") == 1) and ("." in parts):
+                            return True
+                    except Exception:
+                        pass
+                # consider male on X/Y with a single alt allele as hemizygous
+                try:
+                    sex = getattr(varlist[0], "sample_sex", "").lower() if varlist else ""
+                    chrom_norm = (varlist[0].chrom.upper().replace("CHR","")) if varlist else ""
+                    if sex == "male" and chrom_norm in ("X", "Y"):
+                        if "1" in gt and not _is_hom(gt):
+                            return True
+                except Exception:
+                    pass
+                return False
+
+            if is_ar_only:
+                # Gather P/LP and VUS>=5 candidates for this sample/gene
+                plp_vars = [v for v in varlist if getattr(v, "automated_class", "") in ("Pathogenic", "Likely pathogenic")]
+                plp_hets = [v for v in plp_vars if _is_het(getattr(v, "proband_gt", "./."))]
+                plp_homs_or_hemi = [v for v in plp_vars if (_is_hom(getattr(v, "proband_gt", "./.")) or _is_hemizygous_variant(v))]
+
+                # VUS with >=5 points (heterozygous)
+                vus5 = [v for v in varlist if getattr(v, "automated_class", "") == "VUS" and (getattr(v, "total_points", 0) >= 5) and _is_het(getattr(v, "proband_gt", "./."))]
+
+                # 1) If any P/LP is homozygous or hemizygous -> allow normal processing (do not suppress)
+                if plp_homs_or_hemi:
+                    # allow downstream triage to handle these (no suppression)
+                    pass
+                else:
+                    # 2) If >=2 heterozygous P/LP -> allow normal processing (AR pair)
+                    if len(plp_hets) >= 2:
+                        pass
+                    else:
+                        # 3) Single heterozygous P/LP cases -> handle by pairing with VUS>=5
+                        if len(plp_hets) == 1:
+                            primary = plp_hets[0]
+                            if len(vus5) == 0:
+                                # Single heterozygous P/LP with no qualifying VUS -> suppress all variants for this gene/sample (carrier)
+                                note = "Filtered: AR-only gene — single heterozygous P/LP carrier not returned in secondary findings"
+                                for v in varlist:
+                                    v._filtered = True
+                                    v._in_auto = False
+                                    v._in_manual = False
+                                    if not hasattr(v, "filtered_reasons") or v.filtered_reasons is None:
+                                        v.filtered_reasons = []
+                                    if note not in v.filtered_reasons:
+                                        v.filtered_reasons.append(note)
+                                # skip further triage for this gene/sample
+                                continue
+                            elif len(vus5) == 1:
+                                # 1 P/LP + 1 VUS>=5 -> send both to manual review
+                                partner = vus5[0]
+                                manual_note = "Manual: AR pairing candidate — 1 het P/LP paired with 1 het VUS(>=5) -> phasing/pairing review"
+                                for v in (primary, partner):
+                                    v._in_manual = True
+                                    v._in_auto = False
+                                    v._filtered = False
+                                    if not hasattr(v, "manual_reasons") or v.manual_reasons is None:
+                                        v.manual_reasons = []
+                                    if manual_note not in v.manual_reasons:
+                                        v.manual_reasons.append(manual_note)
+                                    manual_ids.add(get_key(v))
+                                # keep other variants filtered (carriers) but do not escalate them
+                                for v in varlist:
+                                    if v not in (primary, partner):
+                                        if not hasattr(v, "filtered_reasons") or v.filtered_reasons is None:
+                                            v.filtered_reasons = []
+                                        carrier_note = "Filtered: same-sample AR-only gene; not part of reported AR pair"
+                                        if carrier_note not in v.filtered_reasons:
+                                            v.filtered_reasons.append(carrier_note)
+                                # continue to next gene/sample (we've decided manual inclusion for the pair)
+                                continue
+                            else:
+                                # 1 P/LP + multiple VUS>=5 -> send P/LP and all VUS>=5 to manual review
+                                manual_note = "Manual: AR pairing candidate — 1 het P/LP paired with multiple het VUS(>=5) -> phasing/pairing review"
+                                for v in ([primary] + vus5):
+                                    v._in_manual = True
+                                    v._in_auto = False
+                                    v._filtered = False
+                                    if not hasattr(v, "manual_reasons") or v.manual_reasons is None:
+                                        v.manual_reasons = []
+                                    if manual_note not in v.manual_reasons:
+                                        v.manual_reasons.append(manual_note)
+                                    manual_ids.add(get_key(v))
+                                # other variants remain filtered
+                                for v in varlist:
+                                    if v not in ([primary] + vus5):
+                                        if not hasattr(v, "filtered_reasons") or v.filtered_reasons is None:
+                                            v.filtered_reasons = []
+                                        carrier_note = "Filtered: same-sample AR-only gene; not part of reported AR pair"
+                                        if carrier_note not in v.filtered_reasons:
+                                            v.filtered_reasons.append(carrier_note)
+                                continue
+                        else:
+                            # No P/LP heterozygotes:
+                            # If there are >=2 VUS>=5 but no P/LP, do not auto-report (remain carrier candidates).
+                            # Keep existing behavior (do not escalate) — optionally add a filtered note.
+                            if vus5:
+                                note = "Filtered: AR-only gene — heterozygous VUS(>=5) without P/LP not reported as secondary finding"
+                                for v in varlist:
+                                    if not hasattr(v, "filtered_reasons") or v.filtered_reasons is None:
+                                        v.filtered_reasons = []
+                                    if note not in v.filtered_reasons:
+                                        v.filtered_reasons.append(note)
+                                continue
+
+            # HQ HGMD phenotype mismatch check with ClinVar fallback:
+            # If a variant has high-quality HGMD evidence (is_hq_pathogenic_db) and an HGMD phenotype
+            # that does not match any ACMG-listed disease for the gene, then check ClinVar phenotype.
+            # Only if neither HGMD nor ClinVar match we escalate the variant to manual review.
+            disease_tokens = [d.strip() for d in re.split(r'[;/\|]+', str(rule.get("disease","") or "")) if d.strip()]
+            for v in varlist:
+                try:
+                    if not getattr(v, "is_hq_pathogenic_db", False):
+                        continue
+                    hgmd_phen = str(getattr(v, "hgmd_phen", "") or "").strip()
+                    if not hgmd_phen:
+                        continue
+
+                    # 1) try HGMD -> ACMG disease match
+                    matched_hgmd = False
+                    for dtk in disease_tokens:
+                        if not dtk:
+                            continue
+                        matched, level, reason = check_disease_match(dtk, hgmd_phen, extra_recs_list=None, gene_rules=None)
+                        if matched:
+                            matched_hgmd = True
+                            break
+
+                    if matched_hgmd:
+                        # HGMD phenotype matches ACMG disease — no manual escalation based on HGMD mismatch
+                        continue
+
+                    # 2) HGMD did not match — try ClinVar phenotype (if present)
+                    clinvar_trait = str(getattr(v, "clinvar_trait", "") or "").strip()
+                    matched_clinvar = False
+                    if clinvar_trait:
+                        for dtk in disease_tokens:
+                            if not dtk:
+                                continue
+                            matched, level, reason = check_disease_match(dtk, clinvar_trait, extra_recs_list=None, gene_rules=None)
+                            if matched:
+                                matched_clinvar = True
+                                break
+
+                    if matched_clinvar:
+                        # ClinVar phenotype matches ACMG disease; add an info note but DO NOT force manual review
+                        note = f"HGMD phenotype '{hgmd_phen}' mismatches ACMG disease but ClinVar trait '{clinvar_trait}' matches; no manual escalation."
+                        if note not in v.manual_reasons:
+                            v.manual_reasons.append(note)
+                        continue
+
+                    # 3) Neither HGMD nor ClinVar matched -> decide: escalate to manual or treat as carrier
+                    # If this variant is a P/LP heterozygote in an effective recessive MOI with no partners -> treat as carrier (filter) instead of manual.
+                    is_plp = getattr(v, "automated_class", "") in ("Pathogenic", "Likely pathogenic")
+                    is_het = _is_het(getattr(v, "proband_gt", "./."))
+                    # use effective MOI for this variant (fall back to gene-level eff_moi)
+                    eff_moi_v = (getattr(v, "_selected_moi", None) or moi or str(rule.get("moi", "") or "")).upper()
+                    is_recessive_v = ("AR" in eff_moi_v) or ("RECESSIVE" in eff_moi_v) or ("XLR" in eff_moi_v)
+
+                    if is_plp and is_het and is_recessive_v:
+                        # check if there are other qualifying partners in varlist (P/LP hom/hemi or VUS>=5 or other P/LP het)
+                        other_plp_vars = [x for x in varlist if x is not v and getattr(x, "automated_class", "") in ("Pathogenic", "Likely pathogenic")]
+                        other_plp_hom_hemi = [x for x in other_plp_vars if _is_hom(getattr(x, "proband_gt", "./.")) or (
+                            (getattr(x, "sample_sex", "").lower() == "male") and (x.chrom.upper().replace("CHR","") in ("X","Y")) and (sum(1 for a in re.split(r'[\/|]', str(getattr(x, "proband_gt", "") or "")) if str(a) == "1") == 1)
+                        )]
+                        other_vus5 = [x for x in varlist if x is not v and getattr(x, "automated_class", "") == "VUS" and (getattr(x, "total_points", 0) >= 5) and _is_het(getattr(x, "proband_gt", "./."))]
+
+                        if len(other_plp_vars) == 0 and len(other_plp_hom_hemi) == 0 and len(other_vus5) == 0:
+                            # treat as carrier -> filter
+                            carrier_note = "Filtered: Recessive heterozygous carrier (single P/LP het with no qualifying partner) - disease-mismatch does not escalate to manual"
+                            if carrier_note not in v.filtered_reasons:
+                                v.filtered_reasons.append(carrier_note)
+                            v._filtered = True
+                            v._in_auto = False
+                            v._in_manual = False
+                            # do not add to manual_ids
+                        else:
+                            # escalate to manual (complex case / potential true reportable mismatch)
+                            if note not in v.manual_reasons:
+                                v.manual_reasons.append(note)
+                            v._in_manual = True
+                            v._in_auto = False
+                            v._filtered = False
+                            manual_ids.add(get_key(v))
+                    else:
+                        # non-recessive or hom/germline cases: escalate as before
+                        if note not in v.manual_reasons:
+                            v.manual_reasons.append(note)
+                        v._in_manual = True
+                        v._in_auto = False
+                        v._filtered = False
+                        manual_ids.add(get_key(v))
+                except Exception:
+                    continue
 
             # inheritance flags
             is_ar = ("AR" in moi) or ("RECESSIVE" in moi)
@@ -3945,9 +4953,12 @@ def strict_triage_and_output(
 
             biologically_valid: List[VariantRecord] = []
             for v in varlist:
-                v._in_auto = False
-                v._in_manual = False
-                v._filtered = True  # default filtered until explicitly unfiltered
+                # Preserve any previously set manual/auto flags (e.g. from earlier HGMD/ClinVar checks).
+                # Initialize flags only when they are not already present to avoid clearing decisions made above.
+                v._in_auto = getattr(v, "_in_auto", False)
+                v._in_manual = getattr(v, "_in_manual", False)
+                # Default filtered state: preserve existing if set, otherwise True until proven otherwise
+                v._filtered = getattr(v, "_filtered", True)
                 # Ensure lists exist
                 if not hasattr(v, "manual_reasons"):
                     v.manual_reasons = []
@@ -4137,6 +5148,43 @@ def strict_triage_and_output(
                     # conservative: if detection fails, do not apply penalty or force manual
                     pass
 
+                # ----- Gene Rules (from ACMG_SF table 'Rules' column) -----
+                # rule may have 'rules_text' stored by load_acmg_table
+                try:
+                    rules_text = (rule.get("rules_text") if isinstance(rule, dict) else None) or ""
+                except Exception:
+                    rules_text = ""
+
+                if rules_text:
+                    decision, matched_lines = evaluate_gene_rules_for_variant(rules_text, v)
+                    # record applied rules on variant for output (preserve earlier entries)
+                    if not hasattr(v, "_rules_applied"):
+                        v._rules_applied = []
+                    # If some lines matched, record them
+                    if matched_lines:
+                        v._rules_applied.extend(matched_lines)
+                    else:
+                        # No rule line matched -> show the raw rules text (helpful for diagnosis / audit)
+                        # Keep it compact (single-line) so output cell is readable
+                        raw_one_line = " | ".join([ln.strip() for ln in _split_rules_text(rules_text)])
+                        v._rules_applied.append(f"RULES_PRESENT_NO_MATCH: {raw_one_line}")
+
+                    if decision == "exclude":
+                        # enforce exclusion: filter variant out and continue
+                        reason = f"Filtered by gene 'Rules' (exclude): { '; '.join(matched_lines) }"
+                        if reason not in v.filtered_reasons:
+                            v.filtered_reasons.append(reason)
+                        # leave v._filtered True and do not add to biologically_valid
+                        continue
+                    elif decision == "include":
+                        # record that variant matched an include rule (we keep it and add a note).
+                        note = f"Included by gene 'Rules': { '; '.join(matched_lines) }"
+                        if note not in v.manual_reasons:
+                            v.manual_reasons.append(note)
+                        # mark a permissive flag (this does not override other QC/filters;
+                        # it is advisory and shown in output)
+                        v._rules_included = True
+                
                 # 4. gene-specific positional filtering (if recommendations include position/exon restrictions)
                 pos_rules = spec_rules.get("position_rules") if spec_rules else None
                 if pos_rules:
@@ -4230,6 +5278,14 @@ def strict_triage_and_output(
                 pass
             # --- AUTOMATIC LOGIC ---
             for v in drivers:
+                # Prefer immediate auto-report for homozygous / hemizygous P/LP (do not try to pair them)
+                if _is_hom(v.proband_gt) or (getattr(v, "sample_sex", "").lower() == "male" and v.chrom.upper().replace("CHR","") in ("X","Y") and not _is_het(v.proband_gt)):
+                    v._in_auto = True
+                    v._filtered = False
+                    v.auto_report_reasons.append("Homozygous/hemizygous P/LP -> automatic report")
+                    auto_ids.add(get_key(v))
+                    continue
+
                 if get_key(v) in manual_ids:
                     continue
 
@@ -4241,7 +5297,7 @@ def strict_triage_and_output(
 
                 # --- Conservative AR blocking block with disease-specific MOI check ---
                 # Determine disease-specific MOI for this variant
-                eff_moi = _select_moi_for_variant(rule, v).upper()
+                eff_moi = (getattr(v, "_selected_moi", None) or moi or "").upper()
                 eff_is_ar = ("AR" in eff_moi) or ("RECESSIVE" in eff_moi)
                 eff_is_xlr = ("XLR" in eff_moi) or ("X-LINKED RECESSIVE" in eff_moi)
                 eff_is_xl_male = (("X" in eff_moi) or ("X-LINKED" in eff_moi) or eff_is_xlr) and (sample_sex == "Male")
@@ -4356,7 +5412,7 @@ def strict_triage_and_output(
                                 v.total_points = getattr(v, "total_points", 0)
 
 
-                # Case B: Algorithmic scoring (Tavtigian)
+                # Case B: Algorithmic scoring (Tavtigian et al., (2018))
                 if ((v.automated_class == "Pathogenic" and v.total_points >= 10) or
                     (v.automated_class == "Likely pathogenic" and v.total_points >= 6)):
                     if getattr(v, "is_hq_conflict_db", False):
@@ -4410,49 +5466,86 @@ def strict_triage_and_output(
                             # treat as hemizygous; leave to auto/manual decisions based on other evidence
                             pass
 
-            # --- Complex recessive: >=2 P/LP variants => manual review for all P/LP hets
+            # --- Complex recessive: >=2 unique P/LP heterozygotes => manual review for all such P/LP hets ---
             ar_path_lp = []
+            seen_keys = set()
+
             for x in drivers:
-                # only consider variants that match a recessive disease according to per-variant MOI selection
-                eff_moi_x = _select_moi_for_variant(rule, x).upper()
-                if (("AR" in eff_moi_x) or ("RECESSIVE" in eff_moi_x)) and _is_het(x.proband_gt) and x.automated_class in ("Pathogenic", "Likely pathogenic"):
+                # defensive: skip None entries
+                if x is None:
+                    continue
+
+                # determine effective MOI for this variant (prefer per-variant selected MOI, then sample-level moi, then rule)
+                try:
+                    eff_moi_x = (getattr(x, "_selected_moi", None) or moi or str(rule.get("moi", "") or "")).upper()
+                except Exception as e:
+                    logger.debug("Failed to determine effective MOI for variant %s: %s", getattr(x, "hgvsp", "?"), e)
+                    eff_moi_x = str(rule.get("moi", "") or "").upper()
+
+                # defensive: compute unique key; if get_key may raise, catch and continue
+                try:
+                    k = get_key(x)
+                except Exception as e:
+                    logger.debug("Failed to compute key for variant object: %s", e)
+                    continue
+
+                # already seen this physical variant (dedup)
+                if k in seen_keys:
+                    continue
+
+                try:
+                    is_recessive_moi = any(tok in eff_moi_x for tok in ("AR", "RECESSIVE", "XLR", "X-LINKED_RECESSIVE"))
+                    is_het_proband = _is_het(getattr(x, "proband_gt", "./."))
+                    is_plp = x.automated_class in ("Pathogenic", "Likely pathogenic")
+                except Exception as e:
+                    logger.debug("Attribute access failed for variant %s: %s", k, e)
+                    continue
+
+                if is_recessive_moi and is_het_proband and is_plp:
                     ar_path_lp.append(x)
+                    seen_keys.add(k)
+
+            # Only escalate if there are at least two distinct P/LP heterozygotes
             if len(ar_path_lp) >= 2:
                 for topv in ar_path_lp:
-                        if get_key(topv) not in manual_ids:
-                            topv.manual_reasons.append("Manual: Recessive gene with multiple heterozygous P/LP variants - phasing and pairing review required")
-                            topv._in_manual = True; topv._filtered = False; topv._in_auto = False
-                            manual_ids.add(get_key(topv))
-                            if get_key(topv) in auto_ids:
-                                auto_ids.remove(get_key(topv))
+                    tk = get_key(topv)
+                    if tk not in manual_ids:
+                        topv.manual_reasons.append("Manual: Recessive gene with multiple heterozygous P/LP variants - phasing and pairing review required")
+                        topv._in_manual = True; topv._filtered = False; topv._in_auto = False
+                        manual_ids.add(tk)
+                        if tk in auto_ids:
+                            auto_ids.remove(tk)
 
             # --- AR Pair Rescue ---
             # Build list of heterozygous variants in this gene/sample that specifically map to a recessive disease MOI
-            passengers_hets = [p for p in passengers if _is_het(p.proband_gt) and (("AR" in _select_moi_for_variant(rule, p).upper()) or ("RECESSIVE" in _select_moi_for_variant(rule, p).upper()))]
-
+            passengers_hets = [
+                p for p in passengers
+                if _is_het(getattr(p, "proband_gt", "./."))
+                and (("AR" in (getattr(p, "_selected_moi", None) or moi or "").upper()) or ("RECESSIVE" in (getattr(p, "_selected_moi", None) or moi or "").upper()))
+            ]
             # If none, skip AR pairing logic
             if passengers_hets:
                 # P/LP heterozygotes as primary candidates
                 plp_hets = [p for p in passengers_hets if p.automated_class in ("Pathogenic", "Likely pathogenic")]
                 # For each P/LP, evaluate potential VUS partners
                 def _phased_trans(gt1: str, gt2: str) -> Optional[bool]:
-                    """
-                    Return True if phased and alleles indicate trans (alts on different haplotypes),
-                    False if phased and indicate cis, None if not phased / cannot decide.
-                    Uses left-side allele comparison: if left allele differs -> trans.
-                    Assumes simple diploid GTs like '0|1' or '1|0'.
-                    """
                     try:
                         if not gt1 or not gt2:
                             return None
                         if "|" not in gt1 or "|" not in gt2:
                             return None
-                        a1_left = gt1.split("|")[0].strip()
-                        a2_left = gt2.split("|")[0].strip()
-                        if a1_left == "." or a2_left == ".":
+                        parts1 = gt1.split("|")
+                        parts2 = gt2.split("|")
+                        if len(parts1) != len(parts2):
+                            # different ploidy or unexpected format -> cannot decide
                             return None
-                        # If left alleles equal => cis (alts on same haplotype), else trans
-                        return a1_left != a2_left
+                        # find index(es) of alt allele "1" (works for simple biallelic; multi-allelic may need extension)
+                        idxs1 = [i for i, p in enumerate(parts1) if p in ("1", "1")]
+                        idxs2 = [i for i, p in enumerate(parts2) if p in ("1", "1")]
+                        if len(idxs1) != 1 or len(idxs2) != 1:
+                            return None
+                        # same index -> cis, different index -> trans
+                        return idxs1[0] != idxs2[0]
                     except Exception:
                         return None
 
@@ -4593,7 +5686,7 @@ def strict_triage_and_output(
     COLUMNS = [
         "sample","Family_ID","chrom","pos","ref","alt","gene","Inheritance",
         "HGVSc","HGVSp","AA_ref","AA_alt","AA_pos","Exon","Consequence","Zygosity","DP","Sample_AF",
-        "acmg_disease_association","Special_Guidance",
+        "acmg_disease_association","Special_Guidance", "Rules_applied",
         "disease_match","disease_match_level","disease_match_reason",
         "clinvar_trait","clinvar_sig","clinvar_stars",
         "hgmd_class","hgmd_phenotype","hgmd_publication_count","hgmd_rankscore", "hgmd_dmsupported",
@@ -4602,7 +5695,7 @@ def strict_triage_and_output(
         "gnomAD_AF","gnomAD_version",
         "REVEL","CADD","SpliceAI","AlphaMissense",
         "ps1_matches","pm5_matches","phase","is_delins_part",
-        "criteria_assigned","criteria_points","total_points","automated_class",
+        "criteria_assigned","criteria_points","total_points","Algorithmic_class", "automated_class",
         # per-criterion explanation columns
         "PVS1_expl","PS1_expl","PM1_expl","PM2_expl","PM3_expl","PM4_expl","PM5_expl",
         "PP1_expl","PP3_expl","PP5_expl",
@@ -4625,6 +5718,13 @@ def strict_triage_and_output(
         rule = gene_rules.get(v.gene, {}) if gene_rules else {}
         row = variant_row_with_disease(v, rule, family_id, recs_map)
 
+        # compute algorithmic classification from criteria_points (pure algorithmic result)
+        try:
+            alg_class = compute_class_from_points(getattr(v, "criteria_points", {}) or {})[0]
+        except Exception:
+            alg_class = ""
+        row["Algorithmic_class"] = alg_class
+
         # attach per-criterion explanations (already included in variant_row_with_disease but keep safe)
         for crit in ("PVS1","PS1","PM1","PM2","PM3","PM4","PM5","PP1","PP3","PP5",
                      "BA1","BS1","BS2","BP4","BP5","BP6","BP7"):
@@ -4633,6 +5733,12 @@ def strict_triage_and_output(
                 row[expl_col] = v.criteria_explanations.get(crit, "")
             except Exception:
                 row[expl_col] = ""
+        
+        # attach Rules_applied string
+        try:
+            row["Rules_applied"] = ";".join(getattr(v, "_rules_applied", [])) if getattr(v, "_rules_applied", None) else ""
+        except Exception:
+            row["Rules_applied"] = ""
 
         # ensure list fields are stringified
         row["ps1_matches"] = json.dumps(getattr(v, "ps1_matches", []), ensure_ascii=False)
@@ -4646,23 +5752,111 @@ def strict_triage_and_output(
         #   and leave 'manual_reasons' empty.
         # - If variant is manual (_in_manual True) keep manual_reasons as-is and comments empty.
         # - Otherwise (neither) keep manual_reasons as-is and comments empty.
-        if getattr(v, "_in_auto", False):
-            # Auto: informational notes go into comments; manual_reasons cleared
-            row["comments"] = ";".join(getattr(v, "manual_reasons", [])) if getattr(v, "manual_reasons", None) else ""
-            row["manual_reasons"] = ""
-        elif getattr(v, "_in_manual", False):
-            # Manual: keep manual_reasons in the manual_reasons column, comments empty
-            row["comments"] = ""
-            row["manual_reasons"] = ";".join(getattr(v, "manual_reasons", []))
-        else:
-            # Neither auto nor manual: move notes into comments (manual_reasons empty)
-            row["comments"] = ";".join(getattr(v, "manual_reasons", [])) if getattr(v, "manual_reasons", None) else ""
-            row["manual_reasons"] = ""
+        filtered_notes = ";".join(getattr(v, "filtered_reasons", []) or [])
+        manual_notes = ";".join(getattr(v, "manual_reasons", []) or [])
+        auto_notes = ";".join(getattr(v, "auto_report_reasons", []) or [])
 
-        # filtered reasons and filtered_out flag
-        row["filtered_reasons"] = ";".join(getattr(v, "filtered_reasons", []))
+        # synchronize sets -> flags 
+        k = get_key(v)
+        if k in auto_ids:
+            v._in_auto = True; v._in_manual = False; v._filtered = False
+        elif k in manual_ids:
+            v._in_manual = True; v._in_auto = False; v._filtered = False
+
+        from collections import OrderedDict
+
+        def _dedupe_keep_order(items):
+            # preserve order, remove exact duplicates and empty strings
+            out = []
+            seen = set()
+            for it in items:
+                if not it:
+                    continue
+                s = str(it).strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+            return out
+
+        # partition manual_reasons into "manual-specific" vs "other" using keyword matching
+        MANUAL_PAT = re.compile(r'(?i)\bmanual\b|delins|phasing|pairing|pairing review|phasing required|hq conflict|conflict|in trans|in cis|hemizygous|hemizygosity')
+
+        def partition_manual_notes(notes_list):
+            manual_specific = []
+            other = []
+            for note in _dedupe_keep_order(notes_list):
+                if MANUAL_PAT.search(note):
+                    manual_specific.append(note)
+                else:
+                    other.append(note)
+            return manual_specific, other
+
+        # collect raw lists from variant
+        raw_manual = getattr(v, "manual_reasons", []) or []
+        raw_filtered = getattr(v, "filtered_reasons", []) or []
+        raw_auto = getattr(v, "auto_report_reasons", []) or []
+
+        # dedupe each source while keeping order
+        raw_manual = _dedupe_keep_order(raw_manual)
+        raw_filtered = _dedupe_keep_order(raw_filtered)
+        raw_auto = _dedupe_keep_order(raw_auto)
+
+        # partition manual notes into manual-specific (explicit reasons for manual) and others
+        manual_specific, manual_other = partition_manual_notes(raw_manual)
+
+        # prepare combined other-notes array (non-manual info) preserving sensible order:
+        # prefer: manual_other first (notes that came from manual list but aren't manual reasons),
+        # then filtered notes, then auto notes — but dedupe overall
+        combined_other = _dedupe_keep_order(manual_other + raw_filtered + raw_auto)
+
+        # Now decide per triage state. Ensure consistent flags if id-sets used upstream:
+        k = get_key(v)
+        if k in auto_ids:
+            v._in_auto = True; v._in_manual = False; v._filtered = False
+        elif k in manual_ids:
+            v._in_manual = True; v._in_auto = False; v._filtered = False
+        # else keep existing flags
+
+        # Fill row fields according to strict rules
+        if getattr(v, "_filtered", False):
+            # Filtered: filtered_reasons MUST be present
+            row["filtered_reasons"] = ";".join(raw_filtered) if raw_filtered else "Filtered: reason not recorded"
+            # Ensure manual/auto empty (per rules)
+            row["manual_reasons"] = ""
+            row["auto_report_reasons"] = ""
+            # Put any other informational notes into comments (optional)
+            row["comments"] = ";".join(combined_other) if combined_other else ""
+        elif getattr(v, "_in_manual", False):
+            # Manual: manual_reasons MUST be present (prefer manual_specific; fallback to raw_manual)
+            if manual_specific:
+                row["manual_reasons"] = ";".join(manual_specific)
+            elif raw_manual:
+                # if there were notes but none matched manual pattern, keep the deduped raw list
+                row["manual_reasons"] = ";".join(raw_manual)
+            else:
+                row["manual_reasons"] = "Manual: reason not recorded"
+            # filtered/auto empty
+            row["filtered_reasons"] = ""
+            row["auto_report_reasons"] = ""
+            # comments: move other informational notes (e.g. PM3 downgrade, low-quality ClinVar, etc.)
+            row["comments"] = ";".join(combined_other) if combined_other else ""
+        elif getattr(v, "_in_auto", False):
+            # Auto: auto_report_reasons MUST be present
+            row["auto_report_reasons"] = ";".join(raw_auto) if raw_auto else "Auto: reason not recorded"
+            row["manual_reasons"] = ""
+            row["filtered_reasons"] = ""
+            # comments: include any informative notes (both manual_other and filtered notes)
+            row["comments"] = ";".join(combined_other) if combined_other else ""
+        else:
+            # Neutral: not filtered, not manual, not auto -> all triage fields empty; keep notes in comments
+            row["filtered_reasons"] = ""
+            row["manual_reasons"] = ""
+            row["auto_report_reasons"] = ""
+            row["comments"] = ";".join(_dedupe_keep_order(raw_manual + raw_filtered + raw_auto)) if (raw_manual or raw_filtered or raw_auto) else ""
+
         # final filtered_out: if variant was selected for AUTO or MANUAL reporting -> it is not filtered out (No)
-        # otherwise it is filtered out (Yes). Это более интуитивное и устойчивое поведение, чем использование промежуточного _filtered.
+        # otherwise it is filtered out (Yes).
         if getattr(v, "_in_auto", False) or getattr(v, "_in_manual", False):
             row["filtered_out"] = "No"
         else:
@@ -4996,34 +6190,108 @@ def perform_pre_analysis_qc(vcf_path: str, proband_id: str) -> Dict[str, Any]:
             chroms = list(vf.header.contigs)
             chr_x_name = next((c for c in chroms if c.lower() in ('chrx', 'x', '23')), None)
             chr_y_name = next((c for c in chroms if c.lower() in ('chry', 'y', '24')), None)
+            # robust Y-detection using proband genotype (not presence of any Y record)
             has_y_variants = False
             if chr_y_name:
                 try:
                     for rec in vf.fetch(chr_y_name):
-                        has_y_variants = True
-                        break
-                except: pass
+                        # determine sample name to inspect
+                        try:
+                            # pysam VariantRecord.samples is dict-like; pick proband if present, else first sample
+                            s_name = proband_id if (proband_id and proband_id in rec.samples) else (list(rec.samples.keys())[0] if rec.samples else None)
+                        except Exception:
+                            # defensive fallback
+                            try:
+                                s_name = proband_id if (proband_id and proband_id in vf.header.samples) else (vf.header.samples[0] if vf.header.samples else None)
+                            except Exception:
+                                s_name = None
+                        if not s_name:
+                            continue
+                        try:
+                            gt = rec.samples[s_name].get('GT')
+                        except Exception:
+                            # sample not present in this record or unexpected structure
+                            gt = None
+                        if not gt:
+                            continue
+                        # gt may be tuple of ints or None; haploid (Y) may be length 1
+                        # consider an ALT allele present if any allele > 0
+                        try:
+                            has_alt = any((a is not None and isinstance(a, int) and a > 0) or (isinstance(a, str) and a not in ("0", ".", "./.", ".|.")) for a in gt if a is not None)
+                        except Exception:
+                            # best-effort: stringify and look for '1' token
+                            try:
+                                gt_s = "/".join(str(x) for x in gt)
+                                has_alt = "1" in gt_s
+                            except Exception:
+                                has_alt = False
+                        if has_alt:
+                            has_y_variants = True
+                            break
+                except Exception:
+                    # keep conservative default (no male inference)
+                    has_y_variants = False
+
             if has_y_variants:
                 inferred_sex = "Male"
-                logger.info(f"QC Sex Check: Inferred Male (Variants found on {chr_y_name})")
+                logger.info(f"QC Sex Check: Inferred Male (ALT on {chr_y_name} for proband)")
                 return {"warnings": warnings, "sex": inferred_sex}
+
+            # ChrX-based inference (robust sample selection and genotype handling)
             if chr_x_name:
                 het_count = 0
                 hom_count = 0
                 total_x = 0
                 try:
                     for rec in vf.fetch(chr_x_name):
-                        if len(rec.samples) == 0: break
-                        s_name = proband_id if proband_id in rec.samples else rec.samples[0].name
-                        gt = rec.samples[s_name]['GT']
-                        if len(gt) >= 2:
-                            if gt[0] != gt[1]: het_count += 1
-                            else: hom_count += 1
-                            total_x += 1
-                        if total_x > 2000: break
-                except Exception: pass
+                        # pick the proband sample if present, else first sample for the record
+                        try:
+                            s_name = proband_id if (proband_id and proband_id in rec.samples) else (list(rec.samples.keys())[0] if rec.samples else None)
+                        except Exception:
+                            try:
+                                s_name = proband_id if (proband_id and proband_id in vf.header.samples) else (vf.header.samples[0] if vf.header.samples else None)
+                            except Exception:
+                                s_name = None
+                        if not s_name:
+                            break
+                        try:
+                            gt = rec.samples[s_name].get('GT')
+                        except Exception:
+                            continue
+                        if not gt:
+                            continue
+                        # gt may be tuple/list
+                        try:
+                            # handle diploid-like GTs
+                            if len(gt) >= 2:
+                                a0 = gt[0]; a1 = gt[1]
+                                if a0 != a1:
+                                    het_count += 1
+                                else:
+                                    hom_count += 1
+                                total_x += 1
+                        except Exception:
+                            # fallback: stringify
+                            try:
+                                gt_s = "/".join(str(x) for x in gt)
+                                if "|" in gt_s or "/" in gt_s:
+                                    parts = re.split(r'[\/|]', gt_s)
+                                    if len(parts) >= 2:
+                                        if parts[0] != parts[1]:
+                                            het_count += 1
+                                        else:
+                                            hom_count += 1
+                                        total_x += 1
+                            except Exception:
+                                continue
+                        # limit processing for speed
+                        if total_x > 2000:
+                            break
+                except Exception:
+                    pass
+
                 if total_x > 0:
-                    ratio = het_count / total_x
+                    ratio = het_count / total_x if total_x else 0.0
                     logger.info(f"QC Sex Check: ChrX Stats - Total: {total_x}, Het: {het_count}, Ratio: {ratio:.2f}")
                     if ratio > 0.15:
                         inferred_sex = "Female"
@@ -5032,7 +6300,7 @@ def perform_pre_analysis_qc(vcf_path: str, proband_id: str) -> Dict[str, Any]:
                     else:
                         inferred_sex = "Unknown"
                 else:
-                     logger.warning("QC Sex Check: No variants found on ChrX to infer sex.")
+                    logger.warning("QC Sex Check: No variants found on ChrX to infer sex.")
         except Exception as e:
             logger.warning(f"QC Sex Check failed: {e}")
     return {"warnings": warnings, "sex": inferred_sex}
@@ -5260,14 +6528,51 @@ def process_vcf(proband_vcf: str,
     filtered_for_report = []
     dropped_count = 0
     for v in candidates:
+        # If strict QC disabled, keep everything
         if not STRICT_QC_ENABLED or not strict_qc:
-            filtered_for_report.append(v); continue
-        dp = v.proband_dp or 0
-        af = v.proband_af or 0.0
-        if dp >= STRICT_MIN_DP and af >= STRICT_MIN_AF:
+            filtered_for_report.append(v)
+            continue
+
+        # Robustly extract DP and AF (fall back to 0 if missing)
+        dp = int(v.proband_dp or 0)
+        af = float(v.proband_af or 0.0)
+
+        # Determine whether variant is homozygous or hemizygous (male X/Y)
+        is_homo = _is_hom(getattr(v, "proband_gt", "./."))
+        is_hemi = False
+        try:
+            # treat normalized chrom names like "chrX" or "X" as sex chromosomes
+            chrom_norm = str(v.chrom or "").upper().replace("CHR", "")
+            if getattr(v, "sample_sex", "").lower() == "male" and chrom_norm in ("X", "Y", "M", "MT"):
+                # If called hom (1/1) on sex chrom in male, treat as hemizygous
+                if is_homo:
+                    is_hemi = True
+                else:
+                    # also accept single-allele encodings as hemizygous (e.g. "1" or "1/."), be defensive
+                    gt = getattr(v, "proband_gt", "") or ""
+                    if "|" in gt:
+                        parts = gt.split("|")
+                    elif "/" in gt:
+                        parts = gt.split("/")
+                    else:
+                        parts = [gt]
+                    # if exactly one allele equals '1' (alt) and another is missing -> consider hemi
+                    try:
+                        if sum(1 for p in parts if str(p) == "1") == 1:
+                            is_hemi = True
+                    except Exception:
+                        pass
+        except Exception:
+            is_hemi = False
+
+        # Adjust DP threshold for homozygous/hemizygous variants
+        min_dp = 5 if (is_homo or is_hemi) else STRICT_MIN_DP
+
+        if dp >= min_dp and af >= STRICT_MIN_AF:
             filtered_for_report.append(v)
         else:
-            v.filtered_reasons.append("Failed strict QC (DP/AF)")
+            # Add a more specific message for failed QC
+            v.filtered_reasons.append(f"Failed strict QC (DP/AF): DP={dp} (min={min_dp}), AF={af:.3f} (min={STRICT_MIN_AF})")
             dropped_count += 1
     logger.info("After strict QC filtering: %d kept for Report, %d low quality (audit only)", len(filtered_for_report), dropped_count)
     all_path, auto_path, manual_path, cnt_auto, cnt_manual = strict_triage_and_output(
@@ -5396,12 +6701,32 @@ def load_acmg_table(path: str) -> Dict[str, Dict[str,Any]]:
             "lof_not_reportable": "not be reported as sfs" in text_blob or "gain-of-function" in text_blob or "gof" in text_blob,
             "disease_requires_confirmation": bool(disease.strip())
         }
+        # Try to detect a 'Rules' column (case-insensitive)
+        rules_col_name = None
+        for possible in ("rules", "rule", "Rules", "RULES"):
+            if possible in df.columns:
+                rules_col_name = possible; break
+        # If not present, try fuzzy match
+        if not rules_col_name:
+            for c in df.columns:
+                if 'rule' in c.lower():
+                    rules_col_name = c
+                    break
+
+        rules_text = ""
+        if rules_col_name:
+            try:
+                rules_text = str(r.get(rules_col_name, "")).strip()
+            except Exception:
+                rules_text = ""
+
         rules[gene_norm] = {
             "reportable": reportable,
             "moi": moi,
             "disease": disease,
             "variants_note": variants_note,
             "special_flags": flags,
+            "rules_text": rules_text,
             "raw_row": {c: str(r.get(c, "")) for c in df.columns}
         }
         if reportable:
