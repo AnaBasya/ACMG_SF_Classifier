@@ -1,9 +1,3 @@
-# ACMG Secondary Findings Classifier — README (updated)
-
-This README describes the current production-ready pipeline implemented in `acmg_sf_classifier.py` for automated classification of ACMG Secondary Findings (SF v3.x).  
-The pipeline annotates VCFs, aggregates multi-source evidence (ClinVar, HGMD, internal DB, gnomAD), predicts NMD/last-exon effects, applies gene-specific rules from the ACMG SF table, and performs conservative automatic vs manual triage.
-
-
 # ACMG Secondary Findings Classifier
 
 ## Overview
@@ -82,12 +76,12 @@ python3 acmg_sf_classifier.py \
   --exons-file data/exons.csv
 ```
 
-Your team’s batch example (as provided):
+Example:
 
 ```bash
 python3 acmg_sf_classifier.py \
   --batch-input-dir ./data/data_batch \
-  --outdir ./batch_results_final \
+  --outdir ./batch_results \
   --acmg-table ACMG_SF_v3.3_full.csv \
   --vep vep \
   --vep-cache /home/anna/anna/ACMG_SF_Classifier/databases/vep/.vep \
@@ -104,7 +98,7 @@ python3 acmg_sf_classifier.py \
   --hgmd /home/nik/share/ccu-ngs/ngs/bases/hgmd/dmsupport/hgmd_2025_vars_dmsupport.csv \
   --exons-file nmd_data/acmg_simple_exons.csv \
   --nmd-table nmd_data/acmg_nmd_table.tsv \
-  --transcript-map refseq2enst_mane.tsv
+  --transcript-map data/refseq2enst_mane.tsv
 ```
 
 ---
@@ -275,7 +269,7 @@ Decision flow:
 - PP3 assignment:
   - SpliceAI ≥ 0.20 → PP3_Moderate (+2)
   - REVEL ≥ 0.932 → PP3_Moderate (+2)
-  - CADD ≥ 30 → treated as strong supporting computational evidence (commonly used as PP3)
+  - CADD ≥ 30 → PP3_Supporting (+1) 
   - REVEL ≥ 0.644 or AlphaMissense ≥ 0.564 → PP3_Supporting (+1)
 - IMPORTANT: PP3 is NOT applied if PVS1 was applied or if variant is a clear LOF/canonical splice consequence (to avoid stacking computational evidence with PVS1).
 
@@ -298,9 +292,8 @@ Decision flow:
   - parental phasing patterns (one variant inherited from father and other from mother),
   - cooccurrence evidence (provided TSV or DB lookup; pipeline accepts `--gnomad-cooccurrence` table).
 
-### PP1 / PS2 (Segregation / De novo)
+### PS2 (De novo)
 - PS2 (confirmed de novo) assigned when proband genotype indicates de novo and parental genotypes support absence in parents; strength depends on confirmation.
-- PP1: segregation evidence used conservatively; strengths (supporting/moderate/strong) may require manual curation.
 
 ### PM1 (Mutational hotspot / functional domain)
 - If variant lies in a documented mutational hotspot or critical domain per gene rules → PM1 (+2).
@@ -311,8 +304,9 @@ Decision flow:
 - Gene name validation: DB entries are validated (normalize_gene_name) to avoid spuriously applying DB evidence for mismatched gene annotations.
 
 ### Conflicts handling
-- If HQ sources disagree between Pathogenic and Benign (substantive conflict) → variant is marked as HQ conflict and routed to manual review.
 - Mild disagreements (Pathogenic vs Likely pathogenic) may be resolved conservatively towards Pathogenic for auto-assignment.
+- If HQ sources disagree between Pathogenic and VUS → variant is marked as HQ conflict and routed to manual review.
+- If HQ sources disagree between VUS and Benign (substantive conflict) → variant is marked as HQ conflict (-1).
 
 ---
 
@@ -371,4 +365,6 @@ Major rules:
 Columns include variant identifiers, gene, HGVSc/HGVSp, REVEL/CADD/SpliceAI values, ClinVar/HGMD/internal DB summary, criteria assigned and per‑criterion textual explanations, total points and automated class, and triage flags (`in_auto_report`, `in_manual_review`, `filtered_out`).
 
 ---
+
 *Developed for clinical NGS workflows at RCMG ("Genome" Centre).*
+
