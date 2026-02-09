@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-02-09T14:31:10Z",
+  "proband_vcf": "./data/batch_sql/14841_2024/27021230_proband.vcf",
+  "annotated_vcf": "./batch_sql_result/individual_results/27021230/27021230_proband.acmg_only.vcf.gz",
+  "candidates_pre_qc": 243,
+  "candidates_post_qc": 243,
+  "dropped_pre_qc": 0,
+  "outputs": {
+    "all": "./batch_sql_result/individual_results/27021230/all_candidates.csv",
+    "auto": "./batch_sql_result/individual_results/27021230/auto_conclusions.csv",
+    "manual": "./batch_sql_result/individual_results/27021230/manual_review_list.csv"
+  },
+  "counts": {
+    "auto": 1,
+    "manual": 0
+  }
+}
