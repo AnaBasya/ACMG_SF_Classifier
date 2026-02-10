@@ -556,9 +556,12 @@ def create_variant_from_extract_line(fields: List[str], sample_name: str = "prob
                 vr.proband_ad = (ad[0], 0)
     vr.proband_af = sample_parsed.get("af")
 
-    # parse AA pos
-    vr.aa_pos = parse_protein_pos(vr.hgvsp)
-
+    # parse AA ref, pos, alt from HGVSp using existing parse_hgvsp_three_letter function
+    aa_ref, aa_pos, aa_alt = parse_hgvsp_extended(vr.hgvsp)
+    vr.aa_ref = aa_ref
+    vr.aa_pos = aa_pos
+    vr.aa_alt = aa_alt
+    
     return vr
 
 def _is_het(gt: str) -> bool:
@@ -579,17 +582,222 @@ def clean_hgvsp(hgvsp: str) -> str:
             return parts[-1]
     return hgvsp
 
+# Valid three-letter amino acid names (capitalized like "Pro")
+VALID_THREE = {
+    "Ala","Arg","Asn","Asp","Cys","Glu","Gln","Gly","His","Ile",
+    "Leu","Lys","Met","Phe","Pro","Ser","Thr","Trp","Tyr","Val",
+    "Sec","Pyl","Ter"
+}
+
+def _normalize_to_three_letter(aa: str) -> Optional[str]:
+    """
+    Normalize an amino-acid token to a three-letter code (capitalized, e.g. 'Pro').
+    Accepts:
+      - three-letter forms (any case): 'Pro', 'pro', 'PRO'
+      - stop/termination tokens: '*', 'Ter', 'STOP' -> returns 'Ter'
+    Returns None if token cannot be interpreted as a valid three-letter AA.
+    """
+    if not aa:
+        return None
+    a = aa.strip()
+    if a == "*":
+        return "Ter"
+    a_norm = a.capitalize()
+    if a_norm.lower() in ("ter", "stop"):
+        return "Ter"
+    if a_norm in VALID_THREE:
+        return a_norm
+    # try title case as a fallback (handles e.g. 'SEc' -> 'Sec')
+    a_title = a.title()
+    if a_title in VALID_THREE:
+        return a_title
+    return None
+
+def parse_hgvsp_three_letter(hgvsp: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Parse an HGVSp value and return (aa_ref_three, aa_pos, aa_alt_three).
+    - aa_ref_three and aa_alt_three are three-letter codes (e.g. 'Pro', 'Ile', 'Ter') or None.
+    - aa_pos is an integer or None.
+    Supported simple forms:
+      - p.Pro404Pro
+      - p.Trp26Ter
+      - p.Trp26*
+      - p.Leu1199  (returns ref + pos, alt=None)
+    Returns (None, None, None) for 'Not provided', '(=)', unsupported forms, or when parsing fails.
+    """
+    if not hgvsp:
+        return (None, None, None)
+    h = hgvsp.strip()
+    # common "not provided" markers
+    if h.lower() in ("not provided", "not_provided", ".", "-", ""):
+        return (None, None, None)
+
+    # Use existing clean_hgvsp if present in globals to preserve current cleaning behavior
+    try:
+        h_clean = clean_hgvsp(h) if 'clean_hgvsp' in globals() else h
+    except Exception:
+        h_clean = h
+
+    # remove leading "p." and unwrap parentheses
+    s = re.sub(r'^\s*p\.', '', h_clean, flags=re.IGNORECASE).strip()
+    s = re.sub(r'^\((.*)\)$', r'\1', s)
+
+    # ignore synonymous notation like p.(=)
+    if s in ("(=)", "=", "?", "p.(=)"):
+        return (None, None, None)
+
+    # Case: REF POS ALT where REF and ALT are three-letter codes or '*' (e.g. "Pro404Pro")
+    m = re.match(r'^(?P<ref>[A-Za-z]{3}|\*)\s*(?P<pos>\d+)\s*(?P<alt>[A-Za-z]{3}|\*)$', s, flags=re.IGNORECASE)
+    if m:
+        ref_raw = m.group("ref")
+        pos_raw = m.group("pos")
+        alt_raw = m.group("alt")
+        try:
+            pos = int(pos_raw)
+        except Exception:
+            pos = None
+        ref_3 = _normalize_to_three_letter(ref_raw)
+        alt_3 = _normalize_to_three_letter(alt_raw)
+        return (ref_3, pos, alt_3)
+
+    # Case: REFposAlt where Alt might be '*', 'Ter', 'Stop', 'X' (e.g. "Trp26*")
+    m2 = re.match(r'^(?P<ref>[A-Za-z]{3})(?P<pos>\d+)(?P<alt>\*|Ter|Stop|X)$', s, flags=re.IGNORECASE)
+    if m2:
+        ref_raw = m2.group("ref")
+        pos = int(m2.group("pos"))
+        alt_raw = m2.group("alt")
+        ref_3 = _normalize_to_three_letter(ref_raw)
+        alt_3 = _normalize_to_three_letter(alt_raw)
+        return (ref_3, pos, alt_3)
+
+    # Case: REFpos (no ALT) e.g. "Leu1199"
+    m3 = re.match(r'^(?P<ref>[A-Za-z]{3}|\*)(?P<pos>\d+)$', s, flags=re.IGNORECASE)
+    if m3:
+        ref_3 = _normalize_to_three_letter(m3.group("ref"))
+        pos = int(m3.group("pos"))
+        return (ref_3, pos, None)
+
+    # Unsupported or complex HGVSp (indels, frameshifts, ranges, splice, etc.)
+    return (None, None, None)
+
+def parse_hgvsp_extended(hgvsp: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Parse HGVSp string to extract AA_ref, AA_pos, AA_alt.
+    Returns ONLY actual amino acid codes (three-letter) or Ter.
+    For frameshift/deletions, AA_alt is None.
+    """
+    if not hgvsp or hgvsp.lower() in ["not provided", ".", "-", ""]:
+        return None, None, None
+    
+    # Clean the HGVSp string
+    hgvsp_clean = clean_hgvsp(hgvsp)
+    
+    # 1. Try standard three-letter parser first (missense/nonsense)
+    ref, pos, alt = parse_hgvsp_three_letter(hgvsp_clean)
+    if ref is not None or pos is not None:
+        # For standard substitutions, return as-is
+        return ref, pos, alt
+    
+    hgvsp_lower = hgvsp_clean.lower()
+    
+    # 2. Handle delins variants: p.Tyr2236_Arg2239delinsTer
+    # Extract the INSERTED amino acid as AA_alt
+    if "delins" in hgvsp_lower:
+        # Pattern: p.Tyr2236_Arg2239delinsTer
+        match = re.search(r'p\.([A-Za-z]{3})(\d+)_[A-Za-z]{3}\d+delins([A-Za-z\*]{1,3})', hgvsp_clean, re.IGNORECASE)
+        if not match:
+            # Pattern: p.Leu4delinsTer (single AA delins)
+            match = re.search(r'p\.([A-Za-z]{3})(\d+)delins([A-Za-z\*]{1,3})', hgvsp_clean, re.IGNORECASE)
+        
+        if match:
+            ref_three = _normalize_to_three_letter(match.group(1))
+            try:
+                pos = int(match.group(2))
+            except:
+                pos = None
+            # Get the inserted amino acid
+            ins_aa = match.group(3) if len(match.groups()) >= 3 else None
+            alt_three = _normalize_to_three_letter(ins_aa) if ins_aa else None
+            return ref_three, pos, alt_three
+    
+    # 3. For frameshifts/deletions/insertions: return AA_ref and pos, but AA_alt = None
+    # The type will be determined from consequence field
+    
+    # Frameshift: p.Ile540fs
+    if "fs" in hgvsp_lower and "delins" not in hgvsp_lower:
+        match = re.search(r'p\.([A-Za-z]{3})(\d+)', hgvsp_clean, re.IGNORECASE)
+        if match:
+            ref_three = _normalize_to_three_letter(match.group(1))
+            try:
+                pos = int(match.group(2))
+            except:
+                pos = None
+            return ref_three, pos, None  
+    
+    # Deletion: p.Lys1617del или p.Leu4_Gln6del
+    if "del" in hgvsp_lower and "delins" not in hgvsp_lower:
+        # Get first AA and position
+        match = re.search(r'p\.([A-Za-z]{3})(\d+)', hgvsp_clean, re.IGNORECASE)
+        if match:
+            ref_three = _normalize_to_three_letter(match.group(1))
+            try:
+                pos = int(match.group(2))
+            except:
+                pos = None
+            return ref_three, pos, None  
+    
+    # Insertion: p.Lys1617_Leu1618insAla
+    if "ins" in hgvsp_lower and "delins" not in hgvsp_lower:
+        # Get the AA before insertion
+        match = re.search(r'p\.([A-Za-z]{3})(\d+)_', hgvsp_clean, re.IGNORECASE)
+        if match:
+            ref_three = _normalize_to_three_letter(match.group(1))
+            try:
+                pos = int(match.group(2))
+            except:
+                pos = None
+            return ref_three, pos, None
+    
+    # Duplication: p.Lys1617dup
+    if "dup" in hgvsp_lower:
+        match = re.search(r'p\.([A-Za-z]{3})(\d+)', hgvsp_clean, re.IGNORECASE)
+        if match:
+            ref_three = _normalize_to_three_letter(match.group(1))
+            try:
+                pos = int(match.group(2))
+            except:
+                pos = None
+            return ref_three, pos, None  
+    
+    return None, None, None
+
 def parse_protein_pos(hgvsp: str) -> Optional[int]:
+    """
+    Return amino-acid position parsed from HGVSp or None.
+    Uses parse_hgvsp_three_letter to avoid duplicated logic.
+    """
     if not hgvsp:
         return None
+    ref, pos, alt = parse_hgvsp_three_letter(hgvsp)
+    return pos
+
+def parse_protein_change_three_letter(hgvsp: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Parse HGVSp string to extract AA_ref, AA_pos, AA_alt in three-letter codes.
+    Returns (aa_ref_three, aa_pos, aa_alt_three)
+    """
+    if not hgvsp:
+        return None, None, None
+    
+    # Clean the HGVSp string
     hgvsp_clean = clean_hgvsp(hgvsp)
-    m = re.search(r'p\.[A-Za-z]{1,3}(\d+)', hgvsp_clean)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
+    
+    # Skip common non-informative values
+    if hgvsp_clean.lower() in ["not provided", ".", "-", "", "p.(=)", "p.?"]:
+        return None, None, None
+    
+    # Use existing function that returns three-letter codes
+    return parse_hgvsp_three_letter(hgvsp_clean)
 
 # --- Parse cDNA pos from HGVSc and map cDNA position -> exon number using nmd_map / tx_map ---
 def parse_cdna_from_hgvsc(hgvsc: str) -> Tuple[Optional[int], Optional[int]]:
@@ -1537,7 +1745,7 @@ class DatabaseManager:
         vr.db_hits = results
         return results
 
-    # ClinVar protein index builder (same as earlier)
+    # ClinVar protein index builder 
     def _build_clinvar_indexes_from_vcf(self, clinvar_path: str):
         if not clinvar_path or not os.path.exists(clinvar_path):
             logger.warning("ClinVar path invalid: %s", clinvar_path)
@@ -1645,11 +1853,6 @@ class DatabaseManager:
         - "Pathogenic" if a Pathogenic (not Likely) variant at same residue (≥1★) is found;
         - "Likely pathogenic" if only Likely pathogenic matches found;
         - None if no suitable matches.
-        Logic:
-        - Uses self.clinvar_protein_index[normalize_gene]
-        - Skips exact same protein change (this would be PS1)
-        - Requires at least 1-star in ClinVar index (stars >= 2)
-        - Ignores benign-only annotations
         """
         if not pos_aa or not gene:
             return None
@@ -1671,24 +1874,11 @@ class DatabaseManager:
             except Exception:
                 pass
 
-            # parse AA position from entry
-            m = re.search(r'p\.[A-Za-z]{1,3}(\d+)', clean_hgvsp(entry_hgvsp) or "")
-            if not m:
-                # fallback: try generic digits
-                m2 = re.search(r'(\d+)', clean_hgvsp(entry_hgvsp) or "")
-                if not m2:
-                    continue
-                try:
-                    entry_pos = int(m2.group(1))
-                except:
-                    continue
-            else:
-                try:
-                    entry_pos = int(m.group(1))
-                except:
-                    continue
-
-            if entry_pos != pos_aa:
+            # Используем функцию parse_protein_pos если она работает
+            # ИЛИ улучшенный парсер
+            entry_pos = extract_aa_position_from_hgvsp(entry_hgvsp)
+            
+            if not entry_pos or entry_pos != pos_aa:
                 continue
 
             # check significance & stars
@@ -3181,108 +3371,136 @@ class ACMGEngine:
           #      is_hq = True
         #except Exception:
           #  pass
+
+        if is_hq and not getattr(vr, "is_hq_conflict_db", False):
+            assigned.append("PP5_Supporting")
+            pts["PP5_Supporting"] = POINTS_MAP.get("PP5_Supporting", 1)
+            vr.criteria_explanations["PP5"] = "PP5_Supporting: high-quality database annotation (ClinVar≥2★ or HGMD DM≥2 pubs or Internal DB P/LP)"
+
+
         # -------------------------
         # PP5ext / BP5ext - extended database-weighted evidence (ClinVar + HGMD)
         # -------------------------
         try:
+            # make deep-ish copies (safe because values are simple)
+            assigned_alg = list(assigned)
+            pts_alg = dict(pts)
+            total_alg = sum(int(x) for x in pts_alg.values()) if pts_alg else 0
+            # compute algorithmic_class from pts_alg (same logic as compute_class_from_points expects dict)
+            algorithmic_class = compute_class_from_points(pts_alg)[0]
+            # store on variant for downstream use / output
+            vr.criteria_assigned_alg = assigned_alg
+            vr.criteria_points_alg = pts_alg
+            vr.total_alg_points = total_alg
+            vr.algorithmic_class = algorithmic_class
+        except Exception:
+            vr.criteria_assigned_alg = assigned
+            vr.criteria_points_alg = pts
+            vr.total_alg_points = sum(int(x) for x in (pts or {}).values()) if pts else 0
+            vr.algorithmic_class = "VUS"
+
+        # Build pts_ext starting from pts_alg but removing legacy PP5/BP5 keys
+        try:
+            pts_ext = dict(pts_alg)  # start from algorithmic pts
+            # remove legacy PP5/BP5 entries if present to avoid double-counting
+            for k in list(pts_ext.keys()):
+                if k.startswith("PP5") or k.startswith("BP5"):
+                    pts_ext.pop(k, None)
+        except Exception:
+            pts_ext = {}
+
+        # Compute PP5ext/BP5ext block (the code you already have — but modify it so it
+        # returns applied_ext_key (str or None), applied_ext_points (int), clin_match, hgmd_match, explanation_str)
+        applied_ext_key = None
+        applied_ext_points = 0
+        clin_match_flag = False
+        hgmd_match_flag = False
+        ext_expl_str = ""
+
+        try:
+            # (reuse your PP5ext logic here, but ensure it sets variables below)
             # Acquire gene-level ACMG disease string for phenotype matching
             rule = self._get_gene_rule(vr.gene) if hasattr(self, "_get_gene_rule") else {}
             acmg_disease = str(rule.get("disease", "") or "").strip()
 
-            # --- 1) ClinVar block calculation ---
+            # --- ClinVar block calculation (same as your code) ---
             clin_raw_sig = (vr.clinvar_sig or "").strip()
             clin_raw_stars = 0
             try:
                 clin_raw_stars = int(str(vr.clinvar_stars or "0"))
             except Exception:
-                # might be non-int like '2' stored differently
                 try:
                     clin_raw_stars = int(float(str(vr.clinvar_stars or "0")))
                 except Exception:
                     clin_raw_stars = 0
 
-            # base points mapping for clinvar significance 
             clin_points_map = {
                 "pathogenic": 3,
                 "likely pathogenic": 2,
-                "likely_pathogenic": 2,
                 "uncertain_significance": -1,
                 "vus": -1,
                 "conflict": -1,
                 "likely benign": -2,
                 "benign": -3,
-                # fallback entries handled as 0
             }
-
-            # star coefficient mapping
-            clin_star_coef_map = {
-                5: 2.0,
-                4: 1.5,
-                3: 1.25,
-                2: 1.0,
-                1: 0.75,
-                0: 0.5
-            }
+            clin_star_coef_map = {5:2.0, 4:1.5, 3:1.25, 2:1.0, 1:0.75, 0:0.5}
             clin_coef = clin_star_coef_map.get(clin_raw_stars, 0.5)
 
-            # determine most relevant clinvar significance token
             clin_sig_token = ""
             if clin_raw_sig:
-                # split and inspect tokens, prefer most pathogenic mention
+                # split on common separators and normalize tokens
                 parts = re.split(r'[;,\|/]+', clin_raw_sig)
-                parts = [p.strip().lower() for p in parts if p and p.strip()]
-                # priorities: pathogenic > likely pathogenic > VUS/conflict > likely benign > benign
-                if any("pathogenic" in p and "likely" not in p for p in parts):
-                    clin_sig_token = "pathogenic"
-                elif any("likely pathogenic" in p or "likely_pathogenic" in p or ("likely" in p and "pathogen" in p) for p in parts):
-                    clin_sig_token = "likely pathogenic"
-                elif any("uncertain" in p or "vus" in p for p in parts):
-                    clin_sig_token = "uncertain_significance"
-                elif any("likely benign" in p for p in parts):
-                    clin_sig_token = "likely benign"
-                elif any("benign" in p for p in parts):
-                    clin_sig_token = "benign"
-                elif any("conflict" in p for p in parts):
-                    clin_sig_token = "conflict"
+                parts = [p.strip().lower().replace('_', ' ') for p in parts if p and p.strip()]
+
+                # flags
+                has_conflict = any('conflict' in p or 'conflicting' in p for p in parts)
+                has_likely_path = any(('likely' in p and 'pathogen' in p) or ('likely pathogenic' == p) for p in parts)
+                # treat strings like "pathogenic/likely pathogenic" correctly: detect both
+                has_path = any('pathogen' in p and 'likely' not in p for p in parts)
+                has_vus = any('uncertain' in p or 'vus' in p or 'uncertain significance' in p for p in parts)
+                has_likely_benign = any('likely benign' in p for p in parts)
+                has_benign = any('benign' in p and 'likely' not in p for p in parts)
+
+                if has_conflict:
+                    clin_sig_token = 'conflict'
+                elif has_likely_path:
+                    # prefer 'likely pathogenic' when both likely and pathogenic occur
+                    clin_sig_token = 'likely pathogenic'
+                elif has_path:
+                    clin_sig_token = 'pathogenic'
+                elif has_vus:
+                    clin_sig_token = 'uncertain_significance'
+                elif has_likely_benign:
+                    clin_sig_token = 'likely benign'
+                elif has_benign:
+                    clin_sig_token = 'benign'
                 else:
-                    # fallback to first part classification-like token
-                    clin_sig_token = parts[0] if parts else ""
+                    # fallback: take first normalized token
+                    clin_sig_token = parts[0] if parts else ''
+
             clin_base_points = clin_points_map.get(clin_sig_token, 0)
             clin_block_raw = float(clin_base_points) * float(clin_coef)
 
-            # phenotype match for ClinVar (compare ACMG disease <-> ClinVar trait)
             clinvar_trait_text = str(vr.clinvar_trait or "")
-            clin_match, clin_match_level, clin_match_reason = check_disease_match(acmg_disease, clinvar_trait_text) if acmg_disease else (False, "no_acmg_disease", "No ACMG disease")
-            # If ClinVar has no DB trait (empty) treat as no match (conservative)
+            clin_match, clin_match_level, clin_match_reason = (False, "no_acmg_disease", "No ACMG disease")
+            if acmg_disease:
+                clin_match, clin_match_level, clin_match_reason = check_disease_match(acmg_disease, clinvar_trait_text)
             if not clinvar_trait_text:
                 clin_match = False
-
-            # if phenotype mismatch -> cap absolute clin_block_raw to 1.0 in direction of sign
+            # cap if mismatch
             if not clin_match:
                 if clin_block_raw > 1.0:
                     clin_block_raw = 1.0
                 elif clin_block_raw < -1.0:
                     clin_block_raw = -1.0
 
-            # --- 2) HGMD block calculation ---
+            # --- HGMD block (same as your code) ---
             hgmd_class_raw = (vr.hgmd_class or "").strip()
-            # map HGMD class to points
-            hgmd_class_map = {
-                "DM": 3,
-                "DM?": 1,
-                "DFP": -1,
-                "DFP?": -1,
-                "DP": -2,
-                "FP": -2,
-                "R": 0,
-                "Not provided": 0,
-                "": 0
-            }
+            hgmd_class_map = {"DM":3,"DM?":1,"DFP":-1,"DP":-2,"FP":-2,"R":0,"":0}
             hgmd_class_key = str(hgmd_class_raw).upper()
-            # canonicalize known variants like 'DM' (some files may include extra text)
             if "DM" in hgmd_class_key and "DM?" not in hgmd_class_key:
                 hgmd_class_key = "DM"
-            elif "DM?" in hgmd_class_key or "DM\?" in hgmd_class_key:
+            elif "DM?" in hgmd_class_key:
                 hgmd_class_key = "DM?"
             elif "DFP" in hgmd_class_key:
                 hgmd_class_key = "DFP"
@@ -3292,8 +3510,6 @@ class ACMGEngine:
                 hgmd_class_key = "FP"
 
             hgmd_class_points = hgmd_class_map.get(hgmd_class_key, 0)
-
-            # compute publication score: dmsupported / pub_count (fallback to 0 if no pubs)
             try:
                 hgmd_pub_count = int(getattr(vr, "hgmd_publication_count", 0) or 0)
             except Exception:
@@ -3304,20 +3520,15 @@ class ACMGEngine:
                 hgmd_dmsup = 0
 
             if hgmd_pub_count > 0:
-                hgmd_pub_score = float(hgmd_dmsup) / float(hgmd_pub_count) if hgmd_pub_count > 0 else 0.0
+                hgmd_pub_score = float(hgmd_dmsup) / float(hgmd_pub_count)
             else:
-                # fallback: if rankscore present and numeric, use it scaled to [0,1] heuristically
                 rankscore_raw = getattr(vr, "hgmd_rankscore", "") or ""
-                hgmd_pub_score = 0.0
                 try:
                     rs = float(str(rankscore_raw))
-                    # attempt to normalise rankscore into [0,1] by dividing by some plausible max (100).
-                    # this is heuristic; if not parsable -> leave score 0.0
                     hgmd_pub_score = min(1.0, max(0.0, rs / 100.0))
                 except Exception:
                     hgmd_pub_score = 0.0
 
-            # pub coefficient mapping
             if hgmd_pub_score >= 0.9:
                 hgmd_pub_coef = 2.0
             elif 0.7 <= hgmd_pub_score < 0.9:
@@ -3331,63 +3542,79 @@ class ACMGEngine:
 
             hgmd_block_raw = float(hgmd_class_points) * float(hgmd_pub_coef)
 
-            # phenotype match for HGMD
             hgmd_trait_text = str(vr.hgmd_phen or "")
-            hgmd_match, hgmd_match_level, hgmd_match_reason = check_disease_match(acmg_disease, hgmd_trait_text) if acmg_disease else (False, "no_acmg_disease", "No ACMG disease")
+            hgmd_match, hgmd_match_level, hgmd_match_reason = (False, "no_acmg_disease", "No ACMG disease")
+            if acmg_disease:
+                hgmd_match, hgmd_match_level, hgmd_match_reason = check_disease_match(acmg_disease, hgmd_trait_text)
             if not hgmd_trait_text:
                 hgmd_match = False
-
-            # apply phenotype mismatch cap per DB block
             if not hgmd_match:
                 if hgmd_block_raw > 1.0:
                     hgmd_block_raw = 1.0
                 elif hgmd_block_raw < -1.0:
                     hgmd_block_raw = -1.0
 
-            # --- Combine two blocks and map into ACMG criterion strength ---
             raw_total = clin_block_raw + hgmd_block_raw
 
-            # Decide mapping: positive -> PP5ext*, negative -> BP5ext*
-            applied_pp5ext = None
-            applied_points = 0
-
+            # mapping raw_total -> ext criterion
             if raw_total >= 8.0:
-                applied_pp5ext = "PP5ext_VeryStrong"
-                applied_points = POINTS_MAP.get("PP5ext_VeryStrong", 8)
+                applied_ext_key = "PP5ext_VeryStrong"
+                applied_ext_points = POINTS_MAP.get("PP5ext_VeryStrong", 8)
             elif raw_total >= 4.0:
-                applied_pp5ext = "PP5ext_Strong"
-                applied_points = POINTS_MAP.get("PP5ext_Strong", 4)
+                applied_ext_key = "PP5ext_Strong"
+                applied_ext_points = POINTS_MAP.get("PP5ext_Strong", 4)
             elif raw_total >= 2.0:
-                applied_pp5ext = "PP5ext_Moderate"
-                applied_points = POINTS_MAP.get("PP5ext_Moderate", 2)
+                applied_ext_key = "PP5ext_Moderate"
+                applied_ext_points = POINTS_MAP.get("PP5ext_Moderate", 2)
             elif raw_total >= 1.0:
-                applied_pp5ext = "PP5ext_Supporting"
-                applied_points = POINTS_MAP.get("PP5ext_Supporting", 1)
+                applied_ext_key = "PP5ext_Supporting"
+                applied_ext_points = POINTS_MAP.get("PP5ext_Supporting", 1)
             elif raw_total <= -6.0:
-                applied_pp5ext = "BP5ext_Strong"
-                applied_points = POINTS_MAP.get("BP5ext_Strong", -4)
+                applied_ext_key = "BP5ext_Strong"
+                applied_ext_points = POINTS_MAP.get("BP5ext_Strong", -4)
             elif raw_total <= -1.0:
-                applied_pp5ext = "BP5ext_Supporting"
-                applied_points = POINTS_MAP.get("BP5ext_Supporting", -1)
+                applied_ext_key = "BP5ext_Supporting"
+                applied_ext_points = POINTS_MAP.get("BP5ext_Supporting", -1)
 
-            # If an extended criterion is selected, record it
-            if applied_pp5ext:
-                assigned.append(applied_pp5ext)
-                pts[applied_pp5ext] = applied_points
-                vr.criteria_explanations["PP5ext_BP5ext"] = (
-                    f"PP5ext/BP5ext: clin_block_raw={clin_block_raw:.3f} (sig={clin_sig_token}, stars={clin_raw_stars}, coef={clin_coef}), "
-                    f"hgmd_block_raw={hgmd_block_raw:.3f} (class={hgmd_class_key}, pubs={hgmd_pub_count}, dmsup={hgmd_dmsup}, pub_score={hgmd_pub_score:.3f}, coef={hgmd_pub_coef}), "
-                    f"raw_total={raw_total:.3f}; phenotype_match_clinvar={clin_match} ({clin_match_reason}); phenotype_match_hgmd={hgmd_match} ({hgmd_match_reason}); applied={applied_pp5ext}"
-                )
-            else:
-                # no ext criterion applies -> no PP5ext/BP5ext assigned
-                vr.criteria_explanations["PP5ext_BP5ext"] = (
-                    f"PP5ext/BP5ext not applied: clin_block_raw={clin_block_raw:.3f}, hgmd_block_raw={hgmd_block_raw:.3f}, raw_total={raw_total:.3f}"
-                )
+            # set flags & explanation
+            clin_match_flag = bool(clin_match)
+            hgmd_match_flag = bool(hgmd_match)
+            ext_expl_str = (
+                f"clin_block_raw={clin_block_raw:.3f} (sig={clin_sig_token}, stars={clin_raw_stars}, coef={clin_coef}); "
+                f"hgmd_block_raw={hgmd_block_raw:.3f} (class={hgmd_class_key}, pubs={hgmd_pub_count}, dmsup={hgmd_dmsup}, pub_score={hgmd_pub_score:.3f}, coef={hgmd_pub_coef}); "
+                f"raw_total={raw_total:.3f}; clin_match={clin_match_flag}; hgmd_match={hgmd_match_flag}; applied={applied_ext_key}"
+            )
+
+            # apply ext criterion to pts_ext if present
+            if applied_ext_key:
+                pts_ext[applied_ext_key] = applied_ext_points
+
         except Exception as e:
-            # fail-safe: do not crash variant evaluation on PP5ext computation
-            logger.debug("PP5ext/BP5ext computation failed: %s", e)
-            vr.criteria_explanations["PP5ext_BP5ext_error"] = str(e)
+            ext_expl_str = f"PP5ext computation error: {e}"
+
+        # compute totals and classes for ext
+        try:
+            total_ext = sum(int(x) for x in pts_ext.values()) if pts_ext else 0
+        except Exception:
+            total_ext = 0
+
+        # compute extended_class using compute_class_from_points by passing pts_ext as criteria_points
+        try:
+            extended_class = compute_class_from_points(pts_ext)[0]
+        except Exception:
+            extended_class = "VUS"
+
+        if applied_ext_key:
+            vr.criteria_assigned_ext = getattr(vr, "criteria_assigned_ext", []) + [applied_ext_key]
+        else:
+            vr.criteria_assigned_ext = getattr(vr, "criteria_assigned_ext", []) or []
+
+        vr.criteria_points_ext = pts_ext
+        vr.total_ext_points = total_ext
+        vr.extended_class = extended_class
+        vr._pp5ext_explanation = ext_expl_str
+        vr._clinvar_phenotype_match = clin_match_flag
+        vr._hgmd_phenotype_match = hgmd_match_flag
 
         # -------------------------
         # Scoring & class assignment (Tavtigian et al., (2018) points model)
@@ -4261,11 +4488,19 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "AlphaMissense": alpha_val,
         "ps1_matches": ps1_str,
         "pm5_matches": pm5_str,
-        "PP5ext_BP5ext": v.criteria_explanations.get("PP5ext_BP5ext", ""),
         "criteria_assigned": ";".join(getattr(v, "criteria_assigned", [])),
         "criteria_points": json.dumps(getattr(v, "criteria_points", {}) or {}, ensure_ascii=False),
-        "total_points": v.total_points,
+        "criteria_assigned_ext": ";".join(getattr(v, "criteria_assigned_ext", [])),
+        "criteria_points_ext": json.dumps(getattr(v, "criteria_points_ext", {}) or {}, ensure_ascii=False),
+        "total_alg_points": getattr(v, "total_alg_points", ""),
+        "total_ext_points": getattr(v, "total_ext_points", ""),
+        "algorithmic_class": getattr(v, "algorithmic_class", "") or "",
         "automated_class": v.automated_class,
+        "extended_class": getattr(v, "extended_class", ""),
+        "clinvar_phenotype_match": "Yes" if getattr(v, "_clinvar_phenotype_match", False) else "No",
+        "hgmd_phenotype_match": "Yes" if getattr(v, "_hgmd_phenotype_match", False) else "No",
+        # explanation for ext criterion (human readable)
+        "PP5ext_BP5ext_expl": getattr(v, "_pp5ext_explanation", ""),
         "phase": v.phase,
         "is_delins_part": "Yes" if v.is_delins_part else "No",
         "in_auto_report": "Yes" if in_auto else "No",
@@ -5978,9 +6213,9 @@ def strict_triage_and_output(
         "gnomAD_AF","gnomAD_version",
         "REVEL","CADD","SpliceAI","AlphaMissense",
         "ps1_matches","pm5_matches","phase","is_delins_part",
-        "criteria_assigned","criteria_points","total_points","Algorithmic_class", "automated_class",
-        # per-criterion explanation columns
-        "PP5ext_BP5ext",
+        "criteria_assigned","criteria_points","criteria_assigned_ext","criteria_points_ext",
+        "total_alg_points","total_ext_points","algorithmic_class","automated_class","extended_class",
+        "clinvar_phenotype_match","hgmd_phenotype_match","PP5ext_BP5ext_expl",
         "PVS1_expl","PS1_expl","PM1_expl","PM2_expl","PM3_expl","PM4_expl","PM5_expl",
         "PP1_expl","PP3_expl","PP5_expl",
         "BA1_expl","BS1_expl","BS2_expl","BP4_expl","BP5_expl","BP6_expl","BP7_expl",
@@ -6002,12 +6237,78 @@ def strict_triage_and_output(
         rule = gene_rules.get(v.gene, {}) if gene_rules else {}
         row = variant_row_with_disease(v, rule, family_id, recs_map)
 
-        # compute algorithmic classification from criteria_points (pure algorithmic result)
+            # --- algorithmic totals & class (prefer precomputed snapshot on variant) ---
         try:
-            alg_class = compute_class_from_points(getattr(v, "criteria_points", {}) or {})[0]
+            # total_alg: prefer v.total_alg_points если задано, иначе суммируем v.criteria_points
+            if getattr(v, "total_alg_points", None) is not None:
+                total_alg = int(v.total_alg_points)
+            else:
+                pts_alg = getattr(v, "criteria_points", {}) or {}
+                if isinstance(pts_alg, str):
+                    try:
+                        pts_alg = json.loads(pts_alg)
+                    except Exception:
+                        pts_alg = {}
+                total_alg = sum(int(x) for x in (pts_alg or {}).values()) if pts_alg else 0
         except Exception:
-            alg_class = ""
-        row["Algorithmic_class"] = alg_class
+            total_alg = 0
+
+        # ensure algorithmic_class consistent: prefer existing v.algorithmic_class snapshot, else alg_class computed above
+        try:
+            algorithmic_class = getattr(v, "algorithmic_class", None) or alg_class or ""
+        except Exception:
+            algorithmic_class = alg_class or ""
+
+        row["total_alg_points"] = total_alg
+        row["algorithmic_class"] = algorithmic_class
+
+        # --- extended totals & class (PP5ext/BP5ext) ---
+        try:
+            # pts_ext: prefer v.criteria_points_ext (may be dict or JSON string), else empty dict
+            pts_ext = getattr(v, "criteria_points_ext", {}) or {}
+            if isinstance(pts_ext, str):
+                try:
+                    pts_ext = json.loads(pts_ext)
+                except Exception:
+                    pts_ext = {}
+            # total_ext: sum of pts_ext values (integers)
+            total_ext = sum(int(x) for x in (pts_ext or {}).values()) if pts_ext else 0
+        except Exception:
+            pts_ext = {}
+            total_ext = 0
+
+        try:
+            # extended_class: prefer v.extended_class if present, else compute
+            extended_class = getattr(v, "extended_class", None)
+            if not extended_class:
+                extended_class = compute_class_from_points(pts_ext)[0] if pts_ext else "VUS"
+        except Exception:
+            extended_class = "VUS"
+
+        # criteria_assigned_ext: prefer attribute, else empty list
+        criteria_assigned_ext = getattr(v, "criteria_assigned_ext", []) or []
+        # ensure criteria_points_ext is json-string for output
+        criteria_points_ext_json = json.dumps(pts_ext or {}, ensure_ascii=False)
+
+        # phenotype matches and explanation
+        clin_match_flag = getattr(v, "_clinvar_phenotype_match", False)
+        hgmd_match_flag = getattr(v, "_hgmd_phenotype_match", False)
+        pp5ext_expl = getattr(v, "_pp5ext_explanation", "")
+
+        # Put extended fields into the row
+        row["criteria_assigned_ext"] = ";".join(criteria_assigned_ext)
+        row["criteria_points_ext"] = criteria_points_ext_json
+        row["total_ext_points"] = total_ext
+        row["extended_class"] = extended_class
+        row["clinvar_phenotype_match"] = "Yes" if clin_match_flag else "No"
+        row["hgmd_phenotype_match"] = "Yes" if hgmd_match_flag else "No"
+        row["PP5ext_BP5ext_expl"] = pp5ext_expl
+
+        # Keep algorithmic criteria fields consistent in output (rewrite to be safe)
+        # criteria_assigned and criteria_points were already set in variant_row_with_disease,
+        # but enforce their format here to avoid inconsistencies:
+        row["criteria_assigned"] = ";".join(getattr(v, "criteria_assigned", []))
+        row["criteria_points"] = json.dumps(getattr(v, "criteria_points", {}) or {}, ensure_ascii=False)
 
         # attach per-criterion explanations (already included in variant_row_with_disease but keep safe)
         for crit in ("PVS1","PS1","PM1","PM2","PM3","PM4","PM5","PP1","PP3","PP5",
@@ -6664,13 +6965,15 @@ def build_variant_record_from_rec(rec, acmg_genes_normalized: set,
         vr.impact = ""
 
     try:
-        hclean = clean_hgvsp(vr.hgvsp or "")
-        m = re.search(r'p\.([A-Za-z\*]{1,3})(\d+)([A-Za-z\*]{1,3})', hclean)
-        if m:
-            vr.aa_ref = m.group(1)
-            vr.aa_pos = int(m.group(2))
-            vr.aa_alt = m.group(3)
+        aa_ref_3, aa_pos, aa_alt_3 = parse_hgvsp_three_letter(vr.hgvsp or "")
+        if aa_ref_3:
+            vr.aa_ref = aa_ref_3
+        if aa_pos is not None:
+            vr.aa_pos = aa_pos
+        if aa_alt_3:
+            vr.aa_alt = aa_alt_3
     except Exception:
+        # preserve existing behavior on failure
         pass
 
     try:
