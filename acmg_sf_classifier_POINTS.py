@@ -4261,6 +4261,7 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "AlphaMissense": alpha_val,
         "ps1_matches": ps1_str,
         "pm5_matches": pm5_str,
+        "PP5ext_BP5ext": v.criteria_explanations.get("PP5ext_BP5ext", ""),
         "criteria_assigned": ";".join(getattr(v, "criteria_assigned", [])),
         "criteria_points": json.dumps(getattr(v, "criteria_points", {}) or {}, ensure_ascii=False),
         "total_points": v.total_points,
@@ -5979,6 +5980,7 @@ def strict_triage_and_output(
         "ps1_matches","pm5_matches","phase","is_delins_part",
         "criteria_assigned","criteria_points","total_points","Algorithmic_class", "automated_class",
         # per-criterion explanation columns
+        "PP5ext_BP5ext",
         "PVS1_expl","PS1_expl","PM1_expl","PM2_expl","PM3_expl","PM4_expl","PM5_expl",
         "PP1_expl","PP3_expl","PP5_expl",
         "BA1_expl","BS1_expl","BS2_expl","BP4_expl","BP5_expl","BP6_expl","BP7_expl",
