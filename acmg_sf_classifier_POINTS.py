@@ -89,6 +89,8 @@ logger = logging.getLogger("acmg_sf_classifier")
 # ---------------------------
 DB_PATHS_DEFAULT = {
     "CLINVAR_VCF": "databases/clinvar/clinvar_with_protein.vcf.gz",
+    "CLINVAR_EXPANDED_CSV": "databases/clinvar/clinvar_expanded.csv" 
+
 }
 
 THRESH = {
@@ -1281,6 +1283,8 @@ class DatabaseManager:
         self.clinvar_vcf: Optional[pysam.VariantFile] = None
         self.hgmd_index = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self.clinvar_protein_index: Dict[str, List[dict]] = defaultdict(list)
+        self.clinvar_submission_index_by_vid = {}
+        self.clinvar_protein_index_extended = {}
         self.internal_db_index = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self.gnomad_vcf_handles: Dict[str, pysam.VariantFile] = {}
         self.gnomad_tsv_handles: Dict[str, Dict[str,Any]] = {}
@@ -1289,6 +1293,12 @@ class DatabaseManager:
         self._open_gnomad_versions(gnomad_v2, gnomad_v3, gnomad_v4)
         if internal_db_path:
             self._load_internal_db(internal_db_path)
+        exp_path = self.paths.get("CLINVAR_EXPANDED_CSV")
+        if exp_path:
+            try:
+                self._load_clinvar_expanded_csv(exp_path)
+            except Exception:
+                logger.warning("Failed to load CLINVAR_EXPANDED_CSV: %s", exp_path)
 
     def _open_clinvar(self):
         p = self.paths.get("CLINVAR_VCF")
@@ -1484,6 +1494,141 @@ class DatabaseManager:
             vr.gnomad_af = best["max_af"]
             vr.gnomad_details = {"version": best["version"], "pop": best["pop"]}
 
+    def _load_clinvar_expanded_csv(self, path: Optional[str]) -> None:
+        """
+        Load clinvar_expanded.csv produced from submission_summary mapping.
+        Builds:
+        - self.clinvar_expanded_by_vid: {VariationID: [submission dicts]}
+        - self.clinvar_expanded_by_qvar: {Query_Variant: [submission dicts]}
+        Each submission dict minimally: {'phenotype','clinsig','review','submission_id','hgvsp','gene','stars'}
+        """
+        if not path or not os.path.exists(path):
+            return
+        try:
+            self.clinvar_expanded_by_vid = defaultdict(list)
+            self.clinvar_expanded_by_qvar = defaultdict(list)
+            if HAVE_PANDAS:
+                df = pd.read_csv(path, sep=';', dtype=str, encoding='utf-8', on_bad_lines='skip').fillna("")
+                cols = {c.lower(): c for c in df.columns}
+                qcol = cols.get('query_variant', 'Query_Variant')
+                vidcol = cols.get('variationid', 'VariationID')
+                phencol = cols.get('reportedphenotypeinfo', 'ReportedPhenotypeInfo')
+                sigcol = cols.get('clinicalsignificance', 'ClinicalSignificance')
+                revcol = cols.get('reviewstatus', 'ReviewStatus')
+                sidcol = cols.get('submissionid', 'SubmissionID')
+                hgvscol = cols.get('hgvs_protein', 'HGVS_Protein')
+                genecol = cols.get('genesymbol', 'GeneSymbol') if 'genesymbol' in cols or 'GeneSymbol' in df.columns else None
+                for _, r in df.iterrows():
+                    qv = str(r.get(qcol, "")).strip()
+                    vid = None
+                    try:
+                        vid = int(str(r.get(vidcol, "")).strip()) if str(r.get(vidcol, "")).strip() else None
+                    except Exception:
+                        vid = None
+                    phen = str(r.get(phencol, "") or "").strip()
+                    clnsig = str(r.get(sigcol, "") or "").strip()
+                    review = str(r.get(revcol, "") or "").strip()
+                    sid = str(r.get(sidcol, "") or "").strip()
+                    hgvsp = str(r.get(hgvscol, "") or "").strip()
+                    gene = str(r.get(genecol, "") or "").strip() if genecol else ""
+                    # compute stars from review text (same logic as elsewhere)
+                    stars = 0
+                    revl = review.lower()
+                    if 'practice_guideline' in revl:
+                        stars = 4
+                    elif 'expert_panel' in revl:
+                        stars = 3
+                    elif 'criteria_provided' in revl and 'multiple_submitters' in revl and 'no_conflict' in revl:
+                        stars = 2
+                    elif 'criteria_provided' in revl:
+                        stars = 1
+                    entry = {"phenotype": phen, "clinsig": clnsig, "review": review, "submission_id": sid,
+                            "hgvsp": hgvsp, "gene": gene, "stars": stars}
+                    if vid is not None:
+                        self.clinvar_expanded_by_vid[int(vid)].append(entry)
+                    if qv:
+                        self.clinvar_expanded_by_qvar[qv].append(entry)
+                        if qv.startswith("chr"):
+                            self.clinvar_expanded_by_qvar[qv.replace("chr","")].append(entry)
+                        else:
+                            self.clinvar_expanded_by_qvar["chr"+qv].append(entry)
+            else:
+                import csv
+                with open(path, "r", encoding='utf-8') as fh:
+                    reader = csv.DictReader(fh, delimiter=';')
+                    for r in reader:
+                        qv = str(r.get('Query_Variant', "")).strip()
+                        vid = None
+                        try:
+                            vid = int(str(r.get('VariationID', "")).strip()) if str(r.get('VariationID', "")).strip() else None
+                        except Exception:
+                            vid = None
+                        phen = str(r.get('ReportedPhenotypeInfo', "") or "").strip()
+                        clnsig = str(r.get('ClinicalSignificance', "") or "").strip()
+                        review = str(r.get('ReviewStatus', "") or "").strip()
+                        sid = str(r.get('SubmissionID', "") or "").strip()
+                        hgvsp = str(r.get('HGVS_Protein', "") or "").strip()
+                        gene = str(r.get('GeneSymbol', "") or "").strip()
+                        # compute stars
+                        stars = 0
+                        revl = review.lower()
+                        if 'practice_guideline' in revl:
+                            stars = 4
+                        elif 'expert_panel' in revl:
+                            stars = 3
+                        elif 'criteria_provided' in revl and 'multiple_submitters' in revl and 'no_conflict' in revl:
+                            stars = 2
+                        elif 'criteria_provided' in revl:
+                            stars = 1
+                        entry = {"phenotype": phen, "clinsig": clnsig, "review": review, "submission_id": sid,
+                                "hgvsp": hgvsp, "gene": gene, "stars": stars}
+                        if vid is not None:
+                            self.clinvar_expanded_by_vid[int(vid)].append(entry)
+                        if qv:
+                            self.clinvar_expanded_by_qvar[qv].append(entry)
+                            if qv.startswith("chr"):
+                                self.clinvar_expanded_by_qvar[qv.replace("chr","")].append(entry)
+                            else:
+                                self.clinvar_expanded_by_qvar["chr"+qv].append(entry)
+            logger.info("Loaded clinvar_expanded: vids=%d qvars=%d", len(self.clinvar_expanded_by_vid), len(self.clinvar_expanded_by_qvar))
+        except Exception as e:
+            logger.warning("Failed to load clinvar_expanded CSV: %s", e)
+
+    def get_submissions_for_query_variant(self, qvar: str) -> List[Dict[str,str]]:
+        """Return list of submission dicts for a query-variant string (robust against 'chr' prefix)."""
+        out = []
+        if not qvar:
+            return out
+        if hasattr(self, "clinvar_expanded_by_qvar"):
+            if qvar in self.clinvar_expanded_by_qvar:
+                out.extend(self.clinvar_expanded_by_qvar[qvar])
+            if qvar.startswith("chr"):
+                alt = qvar.replace("chr","")
+                out.extend(self.clinvar_expanded_by_qvar.get(alt, []))
+            else:
+                alt = "chr" + qvar
+                out.extend(self.clinvar_expanded_by_qvar.get(alt, []))
+        return out
+
+    def _get_expanded_submissions_for_variant(self, variation_id: Optional[int], qvar: Optional[str]) -> List[Dict]:
+        """Return deduplicated expanded submission dicts for a variant by VariationID and/or Query_Variant."""
+        out = []
+        if variation_id is not None and hasattr(self, "clinvar_expanded_by_vid"):
+            out.extend(self.clinvar_expanded_by_vid.get(int(variation_id), []))
+        if qvar and hasattr(self, "clinvar_expanded_by_qvar"):
+            out.extend(self.get_submissions_for_query_variant(qvar))
+        # dedupe by (submission_id, clinsig, phenotype, hgvsp)
+        seen = set()
+        uniq = []
+        for s in out:
+            key = (s.get("submission_id",""), s.get("clinsig",""), s.get("phenotype",""), s.get("hgvsp",""))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(s)
+        return uniq
+    
+
     def _load_internal_db(self, path: str):
         if not os.path.exists(path):
             logger.warning(f"Internal DB path not found: {path}")
@@ -1664,64 +1809,63 @@ class DatabaseManager:
         vr.is_hq_pathogenic_db = False
         vr.is_hq_benign_db = False
         vr.is_hq_conflict_db = False
-        # CLINVAR
+        vr.clinvar_submissions = []  # NEW: ordered list of expanded submission dicts for this variant
+        # CLINVAR (use expanded submissions when available; do NOT use VCF aggregate for phenotype/class/stars)
         clinvar_evidence = []
-        if self.clinvar_vcf:
+        try:
+            # Build qvar key from record if possible
+            qvar = None
             try:
-                c_clean = vr.chrom.replace("chr", "")
-                queries = [c_clean, "chr" + c_clean]
-                found_rec = None
-                for c_q in queries:
-                    try:
-                        for rec in self.clinvar_vcf.fetch(c_q, vr.pos - 1, vr.pos):
-                            if getattr(rec, 'ref', None) != vr.ref: continue
-                            if not (rec.alts and vr.alt in rec.alts): continue
-                            gene_info = rec.info.get('GENEINFO', '')
-                            clinvar_genes = []
-                            if gene_info:
-                                for gene_pair in str(gene_info).split('|'):
-                                    if ':' in gene_pair:
-                                        clinvar_gene = gene_pair.split(':')[0]
-                                        clinvar_genes.append(normalize_gene_name(clinvar_gene))
-                            if clinvar_genes and vr.gene not in clinvar_genes:
-                                vr.manual_reasons.append(f"ClinVar gene mismatch: {clinvar_genes} vs {vr.gene}")
-                                continue
-                            found_rec = rec
-                            break
-                    except: continue
-                    if found_rec: break
-                if found_rec:
-                    clnsig = found_rec.info.get('CLNSIG') or ''
-                    clinvar_sig_str = ";".join(clnsig) if isinstance(clnsig, (list, tuple)) else str(clnsig)
-                    vr.clinvar_sig = clinvar_sig_str
-                    clndn = found_rec.info.get('CLNDN') or ''
-                    vr.clinvar_trait = ";".join(clndn) if isinstance(clndn, (list, tuple)) else str(clndn)
-                    rev = found_rec.info.get('CLNREVSTAT') or ''
-                    rev_str = str(rev).lower()
-                    stars = 0
-                    if 'practice_guideline' in rev_str: stars = 4
-                    elif 'expert_panel' in rev_str: stars = 3
-                    elif 'criteria_provided' in rev_str and 'multiple_submitters' in rev_str and 'no_conflict' in rev_str: stars = 2
-                    elif 'criteria_provided' in rev_str: stars = 1
-                    vr.clinvar_stars = str(stars)
-                    sig_lower = clinvar_sig_str.lower()
-                    if stars >= 2:
-                        if 'benign' in sig_lower and 'pathogen' not in sig_lower:
-                            vr.has_strong_benign_evidence = True
-                            vr.is_hq_benign_db = True
-                            clinvar_evidence.append(("Benign", f"ClinVar_{stars}stars"))
-                        elif 'pathogenic' in sig_lower or 'likely pathogenic' in sig_lower:
-                            vr.has_strong_pathogenic_evidence = True
-                            vr.is_hq_pathogenic_db = True
-                            clinvar_evidence.append((clinvar_sig_str, f"ClinVar_{stars}stars"))
-                        elif 'conflict' in sig_lower:
-                            vr.is_hq_conflict_db = True
-                            vr.conflict_details = "ClinVar Conflict"
-                            clinvar_evidence.append((clinvar_sig_str, f"ClinVar_{stars}stars_conflict"))
-                    else:
-                        vr.manual_reasons.append(f"Low quality ClinVar: {clinvar_sig_str} ({stars} stars)")
-            except Exception as e:
-                logger.debug(f"ClinVar extraction failed: {e}")
+                if getattr(vr, "chrom", None) and getattr(vr, "pos", None) and getattr(vr, "ref", None) is not None and getattr(vr, "alt", None) is not None:
+                    qvar = f"{vr.chrom}-{int(vr.pos)}-{vr.ref}-{vr.alt}"
+            except Exception:
+                qvar = None
+
+            # try to get VariationID from raw annotations if present
+            variation_id = None
+            try:
+                for k in ("VARIATIONID","VAR_ID","VARID","ALLELEID"):
+                    if vr._raw_ann and k in vr._raw_ann:
+                        try:
+                            vv = vr._raw_ann.get(k)
+                            if vv not in (None, "", "."):
+                                variation_id = int(vv)
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                variation_id = None
+
+            expanded = self._get_expanded_submissions_for_variant(variation_id, qvar) if (hasattr(self, 'clinvar_expanded_by_vid') or hasattr(self, 'clinvar_expanded_by_qvar')) else []
+
+            if expanded:
+                # Use only expanded submissions for clinvar evidence (phenotype-aware)
+                for s in expanded:
+                    s_sig = str(s.get("clinsig","") or "")
+                    s_rev = str(s.get("review","") or "")
+                    s_ph = str(s.get("phenotype","") or "")
+                    s_sid = str(s.get("submission_id","") or "")
+                    s_stars = int(s.get("stars", 0) or 0)
+                    # store ordered submission info on variant for downstream output
+                    vr.clinvar_submissions.append({"submission_id": s_sid, "clinsig": s_sig, "phenotype": s_ph, "review": s_rev, "stars": s_stars, "hgvsp": s.get("hgvsp","")})
+                    # interpret significance for evidence (for summary flags)
+                    s_sig_low = s_sig.lower()
+                    if "pathogenic" in s_sig_low and "likely" not in s_sig_low:
+                        clinvar_evidence.append(("Pathogenic", f"ClinVar_Submission_{s_stars}stars"))
+                        vr.has_strong_pathogenic_evidence = True
+                        vr.is_hq_pathogenic_db = True
+                    elif "likely pathogenic" in s_sig_low or ("likely" in s_sig_low and "pathogen" in s_sig_low):
+                        clinvar_evidence.append(("Likely pathogenic", f"ClinVar_Submission_{s_stars}stars"))
+                    elif "benign" in s_sig_low and "pathogen" not in s_sig_low:
+                        clinvar_evidence.append(("Benign", f"ClinVar_Submission_{s_stars}stars"))
+                        vr.has_strong_benign_evidence = True
+                        vr.is_hq_benign_db = True
+            else:
+                # No expanded submissions found -> DO NOT use VCF aggregate for phenotype/class/star by default.
+                pass
+
+        except Exception as e:
+            logger.debug(f"ClinVar expanded extraction failed: {e}")
         results.extend(clinvar_evidence)
         # INTERNAL DB
         internal_evidence = []
@@ -1892,94 +2036,56 @@ class DatabaseManager:
             logger.warning("ClinVar load error: %s", e)
 
     def find_protein_variant_by_hgvsp(self, gene: str, hgvsp: str, pos_aa: int, transcript: str,
-                                      current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
-                                      current_ref: Optional[str] = None, current_alt: Optional[str] = None,
-                                      acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
+                                    current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
+                                    current_ref: Optional[str] = None, current_alt: Optional[str] = None,
+                                    acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
         """
-        Find ClinVar protein entries matching hgvsp for gene (>=2★). Skip the current variant itself
-        when current_chrom/current_pos provided (to avoid self-matching).
-
-        If acmg_disease is provided, only return entries whose ClinVar trait (CLNDN) matches the ACMG disease
-        according to check_disease_match() — this enforces phenotype-aware matching.
+        Phenotype-aware PS1/PM5 lookup using ONLY clinvar_expanded submissions when available.
+        If no expanded submissions are available for the variant, this function returns [] (no fallback).
         """
         if not hgvsp or not gene:
             return []
-        norm_gene = normalize_gene_name(gene)
+        qvar_key = None
+        if current_chrom and current_pos and current_ref is not None and current_alt is not None:
+            qvar_key = f"{current_chrom}-{current_pos}-{current_ref}-{current_alt}"
+
         results = []
-        cur_ch = normalize_chrom(current_chrom) if current_chrom else None
-        cur_pos = int(current_pos) if current_pos is not None else None
-        cur_ref = str(current_ref) if current_ref is not None else None
-        cur_alt = str(current_alt) if current_alt is not None else None
+        seen = set()
+        current_hgvsp_clean = clean_hgvsp(hgvsp)
 
-        for entry in self.clinvar_protein_index.get(norm_gene, []):
-            # Skip entries that are not gene-normal
-            if entry.get('gene_norm', '') != norm_gene:
-                continue
-            # Require at least 2★ for high-quality entries
-            if int(entry.get('stars', 0) or 0) < 2:
-                continue
+        # Prefer expanded submissions
+        expanded = []
+        if qvar_key and hasattr(self, "clinvar_expanded_by_qvar"):
+            expanded.extend(self.get_submissions_for_query_variant(qvar_key))
 
-            # Skip benign-only submissions
-            clnsig_entry = str(entry.get('clnsig', '') or "").lower()
-            if "benign" in clnsig_entry and "pathogen" not in clnsig_entry:
-                continue
-
-            # If acmg_disease provided, require ClinVar trait match
-            if acmg_disease:
-                trait_text = str(entry.get('clndn', '') or "")
-                matched, _, _ = check_disease_match(acmg_disease, trait_text)
-                if not matched:
-                    # Skip this submission — phenotype mismatch
-                    continue
-
-            # Skip if this entry represents the same genomic variant as the query (if coords present)
+        # If expanded is empty, do NOT consult clinvar_with_protein.vcf (by design)
+        for s in expanded:
             try:
-                ent_ch = normalize_chrom(entry.get('chrom')) if entry.get('chrom') else None
-                ent_pos = int(entry.get('pos')) if entry.get('pos') else None
-                ent_ref = str(entry.get('ref')) if entry.get('ref') else None
-                ent_alt = str(entry.get('alt')) if entry.get('alt') else None
-                if cur_ch and ent_ch and cur_pos is not None and ent_pos is not None:
-                    if cur_ch == ent_ch and int(cur_pos) == int(ent_pos):
-                        if (cur_ref is None or ent_ref is None) or (cur_ref == ent_ref and cur_alt == ent_alt):
-                            continue
-            except Exception:
-                pass
-
-            entry_hgvsp_clean = clean_hgvsp(entry.get('hgvsp', ''))
-            current_hgvsp_clean = clean_hgvsp(hgvsp)
-            
-            if entry_hgvsp_clean == current_hgvsp_clean:
-                # Split the significance string into tokens for proper analysis
-                # ClinVar often contains values like "Pathogenic/Likely_pathogenic" or "Pathogenic, Likely_pathogenic"
-                tokens = re.split(r'[;,\|/]+', clnsig_entry)
-                tokens = [t.strip() for t in tokens if t.strip()]
-                
-                # Check for Pathogenic (without Likely)
-                has_pathogenic = any(("pathogenic" in t and "likely" not in t) for t in tokens)
-                
-                # Check for Likely pathogenic
-                has_likely_pathogenic = any(
-                    ("likely pathogenic" in t) or 
-                    (t == "likely pathogenic") or 
-                    ("likely" in t and "pathogen" in t and "pathogenic" in t)
-                    for t in tokens
-                )
-                
-                # Also check the original string as fallback in case tokenization didn't work
-                if not has_pathogenic and not has_likely_pathogenic:
-                    if "pathogenic" in clnsig_entry and "likely" not in clnsig_entry:
-                        has_pathogenic = True
-                    elif "likely pathogenic" in clnsig_entry or ("likely" in clnsig_entry and "pathogen" in clnsig_entry):
-                        has_likely_pathogenic = True
-                
-                if has_pathogenic:
-                    results.append((entry.get('clnsig'), "ClinVar_Pathogenic", entry))
-                elif has_likely_pathogenic:
-                    results.append((entry.get('clnsig'), "ClinVar_Likely_pathogenic", entry))
+                phen = s.get("phenotype","") or ""
+                if acmg_disease:
+                    matched, _, _ = check_disease_match(acmg_disease, phen)
+                    if not matched:
+                        continue
+                s_hgvsp = clean_hgvsp(s.get("hgvsp","") or "")
+                # if expanded record has HGVSp and it doesn't match current -> skip (PS1 requires same AA change)
+                if s_hgvsp and current_hgvsp_clean and s_hgvsp != current_hgvsp_clean:
+                    continue
+                s_sig = s.get("clinsig","") or ""
+                sid = s.get("submission_id","") or ""
+                key = f"sub:{sid}|{s_sig}|{phen}|{s_hgvsp}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                s_sig_low = s_sig.lower()
+                if "pathogenic" in s_sig_low and "likely" not in s_sig_low:
+                    results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
+                elif "likely pathogenic" in s_sig_low or ("likely" in s_sig_low and "pathogen" in s_sig_low):
+                    results.append((s_sig, "ClinVar_Submission_Likely_pathogenic", s))
                 else:
-                    # If category cannot be determined but entry exists, add with generic source
-                    results.append((entry.get('clnsig'), "ClinVar", entry))
-                    
+                    results.append((s_sig, "ClinVar_Submission", s))
+            except Exception:
+                continue
+
         return results
 
     def check_pm5_variants(self, gene: str, pos_aa: int, current_hgvsp: str) -> List[Dict[str, Any]]:
@@ -3528,6 +3634,27 @@ class ACMGEngine:
                 assigned.append("PP3_Supporting")
                 pts["PP3_Supporting"] = POINTS_MAP.get("PP3_Supporting", 1)
                 vr.criteria_explanations["PP3"] = f"PP3_Supporting: REVEL={r_score:.3f} or AlphaMissense={a_score:.3f} >= supporting thresholds"
+       
+        # ---------------------------------------------------------------------
+        # SUPPRESS PS2: do not allow PS2 (de novo) criteria in automated scoring.
+        # PS2 was intentionally disabled by policy: never apply PS2 in this pipeline.
+        # Remove any PS2_* keys from assigned criteria and pts mapping, and add
+        # a short audit explanation so curators can see the reason.
+        # ---------------------------------------------------------------------
+        try:
+            ps2_keys = [k for k in list(pts.keys()) if str(k).upper().startswith("PS2")]
+            if ps2_keys:
+                for k in ps2_keys:
+                    # remove from points map
+                    pts.pop(k, None)
+                # remove from assigned list too
+                assigned = [a for a in assigned if not str(a).upper().startswith("PS2")]
+                # record an explanation for PS2 suppression so it appears in audit logs/explanations
+                vr.criteria_explanations["PS2_suppressed"] = "PS2 suppressed: de novo evidence (PS2) is not considered in automated scoring."
+        except Exception:
+            # never fail classification because of suppression bookkeeping
+            pass
+
         # -------------------------
         # Extended DB-weighted scoring (PP5ext/BP5ext) and final classification
         # -------------------------
@@ -3551,7 +3678,7 @@ class ACMGEngine:
         rule = self._get_gene_rule(vr.gene) if hasattr(self, "_get_gene_rule") else {}
         acmg_disease = str(rule.get("disease", "") or "").strip()
 
-        # --- ClinVar block (simplified and robust) ---
+        # --- ClinVar block ---
         clin_block_raw = 0.0
         clin_match_flag = False
         CLIN_BASE_MAP = {
@@ -3578,24 +3705,39 @@ class ACMGEngine:
                 except (ValueError, TypeError):
                     agg_stars = 0
                 
-                # Normalize significance string
-                ls = agg_sig.lower().replace("_", " ")
+                # Split on common separators to handle combined terms
+                parts = re.split(r'[;,\|/]+', agg_sig.lower())
+                parts = [p.strip().replace("_", " ") for p in parts if p.strip()]
                 
-                # Determine base points based on significance
+                # Determine the strongest classification
                 base = 0
-                if "conflict" in ls or "conflicting" in ls:
+                has_pathogenic = False
+                has_likely_pathogenic = False
+                
+                for p in parts:
+                    p_clean = p.strip()
+                    if p_clean == "likely pathogenic" or "likely pathogenic" in p_clean:
+                        has_likely_pathogenic = True
+                    elif "pathogenic" in p_clean and "likely" not in p_clean:
+                        has_pathogenic = True
+                
+                if has_pathogenic:
+                    base = CLIN_BASE_MAP.get("pathogenic", 3)
+                elif has_pathogenic and has_likely_pathogenic:
+                    base = CLIN_BASE_MAP.get("pathogenic", 3)  
+                elif has_likely_pathogenic:
+                    base = CLIN_BASE_MAP.get("likely pathogenic", 2)
+                elif "conflict" in " ".join(parts):
                     base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1)
-                elif "pathogenic" in ls:
-                    if "likely" in ls:
-                        base = CLIN_BASE_MAP.get("likely pathogenic", 2)
-                    else:
-                        base = CLIN_BASE_MAP.get("pathogenic", 3)
-                elif "benign" in ls:
-                    if "likely" in ls:
-                        base = CLIN_BASE_MAP.get("likely benign", -2)
-                    else:
+                elif any("benign" in p for p in parts):
+                    has_benign = any(p == "benign" or (p == "benign" and "likely" not in p) for p in parts)
+                    has_likely_benign = any("likely benign" in p for p in parts)
+                    
+                    if has_benign:
                         base = CLIN_BASE_MAP.get("benign", -3)
-                elif "uncertain" in ls or "vus" in ls:
+                    elif has_likely_benign:
+                        base = CLIN_BASE_MAP.get("likely benign", -2)
+                elif any("uncertain" in p or "vus" in p for p in parts):
                     base = CLIN_BASE_MAP.get("uncertain significance", -1)
                 
                 # Apply star coefficient
@@ -3604,11 +3746,32 @@ class ACMGEngine:
                 
                 # Check phenotype match
                 clinvar_trait_text = str(vr.clinvar_trait or "")
+                clin_match_flag = False
+                clin_match_level = ""
+                clin_match_reason = ""
                 if acmg_disease and clinvar_trait_text:
                     try:
-                        clin_match_flag, _, _ = check_disease_match(acmg_disease, clinvar_trait_text)
+                        matched, match_level, match_reason = check_disease_match(acmg_disease, clinvar_trait_text)
+                        clin_match_flag = bool(matched)
+                        clin_match_level = match_level or ""
+                        clin_match_reason = match_reason or ""
                     except Exception:
                         clin_match_flag = False
+                        clin_match_level = ""
+                        clin_match_reason = ""
+                else:
+                    # no ClinVar trait or no acmg disease -> explicit negative/unknown match
+                    clin_match_flag = False
+                    clin_match_level = "no_db_phenotype" if not clinvar_trait_text else ""
+                    clin_match_reason = "No ClinVar trait text" if not clinvar_trait_text else ""
+
+                # persist ClinVar phenotype-match meta on the variant record for downstream audit
+                try:
+                    vr._clinvar_phenotype_match = bool(clin_match_flag)
+                    vr._clinvar_phenotype_match_level = str(clin_match_level)
+                    vr._clinvar_phenotype_match_reason = str(clin_match_reason)
+                except Exception:
+                    pass
                 
                 # Cap if no phenotype match (but only if we have non-zero block)
                 if not clin_match_flag and clin_block_raw != 0:
@@ -3650,16 +3813,7 @@ class ACMGEngine:
         except Exception:
             hgmd_dmsup = 0
 
-        if hgmd_pub_count > 0:
-            hgmd_pub_score = float(hgmd_dmsup) / float(hgmd_pub_count) if hgmd_pub_count else 0.0
-        else:
-            # fallback to rankscore if pubs absent
-            rankscore_raw = getattr(vr, "hgmd_rankscore", "") or ""
-            try:
-                rs = float(str(rankscore_raw))
-                hgmd_pub_score = min(1.0, max(0.0, rs / 100.0))
-            except Exception:
-                hgmd_pub_score = 0.0
+        hgmd_pub_score = float(hgmd_dmsup) / float(hgmd_pub_count) if hgmd_pub_count else 0.0
 
         # Map hgmd_pub_score to coefficient
         if hgmd_pub_score >= 0.9:
@@ -3672,17 +3826,41 @@ class ACMGEngine:
             hgmd_pub_coef = 0.75
         else:
             hgmd_pub_coef = 0.5
+        
+        # Persist HGMD pub score + coefficient for downstream reporting/audit
+        try:
+            vr._hgmd_pub_score = float(hgmd_pub_score)
+        except Exception:
+            vr._hgmd_pub_score = None
+        try:
+            vr._hgmd_pub_coef = float(hgmd_pub_coef)
+        except Exception:
+            vr._hgmd_pub_coef = None
 
         hgmd_block_raw = float(hgmd_class_points) * float(hgmd_pub_coef)
 
-        # phenotype match for HGMD (separately)
+        # phenotype match for HGMD
         hgmd_match_flag = False
+        hgmd_match_level = ""
+        hgmd_match_reason = ""
         hgmd_trait_text = str(vr.hgmd_phen or "")
         if acmg_disease and hgmd_trait_text:
             try:
-                hgmd_match_flag, _, _ = check_disease_match(acmg_disease, hgmd_trait_text)
+                matched_h, match_level_h, match_reason_h = check_disease_match(acmg_disease, hgmd_trait_text)
+                hgmd_match_flag = bool(matched_h)
+                hgmd_match_level = match_level_h or ""
+                hgmd_match_reason = match_reason_h or ""
             except Exception:
                 hgmd_match_flag = False
+                hgmd_match_level = ""
+                hgmd_match_reason = ""
+        # persist HGMD phenotype-match meta on the variant record for downstream audit
+        try:
+            vr._hgmd_phenotype_match = bool(hgmd_match_flag)
+            vr._hgmd_phenotype_match_level = str(hgmd_match_level)
+            vr._hgmd_phenotype_match_reason = str(hgmd_match_reason)
+        except Exception:
+            pass
 
         # If no phenotype match in HGMD, cap HGMD block to [-1.0, +1.0]
         if not hgmd_match_flag:
@@ -3709,7 +3887,7 @@ class ACMGEngine:
         elif raw_total >= 1.0:
             applied_ext_key = "PP5ext_Supporting"
             applied_ext_points = POINTS_MAP.get("PP5ext_Supporting", 1)
-        elif -1.9 <= raw_total <= -1.0:
+        elif -1.9 <= raw_total <= -0.5:
             applied_ext_key = "BP5ext_Supporting"
             applied_ext_points = POINTS_MAP.get("BP5ext_Supporting", -1)
         elif -3.9 <= raw_total <= -2.0:
@@ -3807,6 +3985,32 @@ class ACMGEngine:
         except Exception as _e:
             logger.debug("Failed to persist automated/extended class info: %s", _e)
 
+        # ---------------------------------------------------------------------
+        # Additional rule: If exactly TWO pathogenic-type criteria are present,
+        # the variant cannot be called "Pathogenic" (but may still be "Likely pathogenic").
+        # This enforces an extra conservative guard: strict Pathogenic requires >2 such criteria.
+        # ---------------------------------------------------------------------
+        try:
+            path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS", "PS", "PM", "PP"]))
+            # If algorithmic/extended model produced "Pathogenic" but only 2 pathogenic criteria -> downgrade to Likely pathogenic
+            if ( (extended_class or "").startswith("Pathogenic") ) and path_cnt == 2:
+                # downgrade Pathogenic -> Likely pathogenic
+                extended_class = "Likely pathogenic"
+                # ensure variant record reflects the downgrade for downstream code
+                try:
+                    vr.extended_class = "Likely pathogenic"
+                except Exception:
+                    pass
+                # add an audit/manual note explaining downgrade
+                note = "Downgraded Pathogenic -> Likely pathogenic: only 2 pathogenic-type criteria present (policy)"
+                if not hasattr(vr, "manual_reasons") or vr.manual_reasons is None:
+                    vr.manual_reasons = []
+                vr.manual_reasons.append(note)
+                # keep criteria_points etc intact; only class is adjusted
+        except Exception:
+            # do not break classification pipeline if counting fails
+            path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS", "PS", "PM", "PP"]))
+
         # Apply minimum-pathogenic-criteria guard once (use pathogenic-criterion count)
         path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS", "PS", "PM", "PP"]))
         if (extended_class.startswith("Path") or extended_class.startswith("Likely path")) and path_cnt < MIN_PATHOGENIC_CRITERIA:
@@ -3882,83 +4086,161 @@ class ACMGEngine:
             return "insufficient_data"
 
     def apply_pm3_batch(self, candidates: List[VariantRecord]) -> None:
+        """
+        PM3 batch scoring (reworked):
+
+        - Treat every sample independently (mono-sample mode). This method still groups
+          variants by sample+gene to compute PM3 contributions across variants in the same sample.
+        - PM3 maximum strength is SUPPORTING (PM3_Supporting).
+        - PM3 is applied ONLY when there is NO evidence that candidate variants are in CIS.
+          If any confirmed cis evidence exists for a given variant relative to partner(s),
+          PM3 is NOT applied for that variant and an audit note is added.
+        - Phasing evidence (parental or phased GT) is respected to detect confirmed trans/cis.
+        - Contributions logic (unphased vs confirmed in-trans) is preserved for scoring,
+          but the final assigned strength is capped to MP3_SUPPORTING.
+        """
         by_sample_gene = defaultdict(lambda: defaultdict(list))
         for v in candidates:
             by_sample_gene[v.sample][v.gene].append(v)
+
         for sample, genes in by_sample_gene.items():
             for gene, varlist in genes.items():
                 rule = self._get_gene_rule(gene)
                 moi = str(rule.get("moi", "")).upper()
+                # Only consider PM3 for genes with recessive MOI
                 if not ("AR" in moi or "RECESSIVE" in moi or "XLR" in moi):
                     continue
+
                 for v in varlist:
                     pm3_score = 0.0
                     unphased_contributions = 0.0
                     criteria_details = []
+                    cis_found_for_variant = False
+
+                    # If variant is homozygous -> count as 0.5 (carrier/homozygous support) per original pipeline
                     if _is_hom(v.proband_gt):
                         pm3_score += 0.5
                         unphased_contributions += 0.5
                         criteria_details.append("homozygous: +0.5")
+
+                    # compare v to other variants in same sample/gene
                     for other_v in varlist:
                         if other_v == v:
                             continue
+
+                        # Determine simple phasing relationships using available genotype fields.
                         in_trans_confirmed = False
-                        if (_is_het(v.father_gt) and _is_wt(v.mother_gt) and
-                            _is_het(other_v.mother_gt) and _is_wt(other_v.father_gt)):
-                            in_trans_confirmed = True
-                        elif (_is_het(v.mother_gt) and _is_wt(v.father_gt) and
-                            _is_het(other_v.father_gt) and _is_wt(other_v.mother_gt)):
-                            in_trans_confirmed = True
                         in_cis_confirmed = False
-                        if (_is_het(v.father_gt) and _is_het(other_v.father_gt)) or (_is_het(v.mother_gt) and _is_het(other_v.mother_gt)):
-                            in_cis_confirmed = True
+
+                        # parental-derived in-trans detection (if parents were provided as mono-samples,
+                        # that does not serve as per-variant parental phasing here; however if parental
+                        # GTs were present on the same VariantRecord they would appear in father_gt/mother_gt)
+                        try:
+                            if (_is_het(v.father_gt) and _is_wt(v.mother_gt) and
+                                _is_het(other_v.mother_gt) and _is_wt(other_v.father_gt)):
+                                in_trans_confirmed = True
+                        except Exception:
+                            pass
+                        try:
+                            if (_is_het(v.mother_gt) and _is_wt(v.father_gt) and
+                                _is_het(other_v.father_gt) and _is_wt(other_v.mother_gt)):
+                                in_trans_confirmed = True
+                        except Exception:
+                            pass
+
+                        # simple same-parent het => cis evidence
+                        try:
+                            if (_is_het(v.father_gt) and _is_het(other_v.father_gt)) or (_is_het(v.mother_gt) and _is_het(other_v.mother_gt)):
+                                in_cis_confirmed = True
+                        except Exception:
+                            pass
+
+                        # Additionally, use fully-phased proband GT (|) if present to detect cis/trans
+                        try:
+                            def _phased_index(gt: str) -> Optional[int]:
+                                if not gt or '|' not in gt:
+                                    return None
+                                parts = gt.split('|')
+                                try:
+                                    if parts.count('1') == 1:
+                                        return parts.index('1')
+                                except Exception:
+                                    pass
+                                for idx, p in enumerate(parts):
+                                    if str(p) == '1':
+                                        return idx
+                                return None
+
+                            idx_v = _phased_index(v.proband_gt)
+                            idx_o = _phased_index(other_v.proband_gt)
+                            if idx_v is not None and idx_o is not None:
+                                # same index -> cis; different index -> trans
+                                if idx_v == idx_o:
+                                    in_cis_confirmed = True
+                                else:
+                                    in_trans_confirmed = True
+                        except Exception:
+                            pass
+
+                        # External cooccurrence evidence (recs_map/cooccurrence) may be present in the broader pipeline,
+                        # but apply_pm3_batch is conservative here and only uses explicit cis confirmation to disallow PM3.
+                        # Record cis evidence at per-variant level:
+                        if in_cis_confirmed:
+                            cis_found_for_variant = True
+                            criteria_details.append(f"confirmed in cis with {other_v.hgvsp} (no PM3)")
+                            # No PM3 points contributed for cis pairs; continue to next partner
+                            continue
+
+                        # if confirmed in trans, award stronger contribution:
                         if in_trans_confirmed:
-                            if other_v.automated_class in ["Pathogenic", "Likely pathogenic"]:
+                            if other_v.automated_class in ("Pathogenic", "Likely pathogenic"):
                                 pm3_score += 1.0
                                 criteria_details.append(f"confirmed in trans with P/LP ({other_v.hgvsp}): +1.0")
                             elif other_v.automated_class == "VUS":
                                 pm3_score += 0.25
                                 criteria_details.append(f"confirmed in trans with VUS ({other_v.hgvsp}): +0.25")
-                        elif in_cis_confirmed:
-                            criteria_details.append(f"confirmed in cis with {other_v.hgvsp} (no PM3 points)")
-                        else:
-                            contribution = 0.0
-                            if other_v.automated_class == "Pathogenic":
-                                contribution = 0.5
-                                criteria_details.append(f"unphased with P ({other_v.hgvsp}): +0.5")
-                            elif other_v.automated_class == "Likely pathogenic":
-                                contribution = 0.5
-                                criteria_details.append(f"unphased with LP ({other_v.hgvsp}): +0.5")
-                            if unphased_contributions + contribution <= 1.0:
-                                unphased_contributions += contribution
-                                pm3_score += contribution
-                            elif unphased_contributions < 1.0:
-                                remaining = 1.0 - unphased_contributions
-                                unphased_contributions += remaining
-                                pm3_score += remaining
-                                criteria_details.append(f"unphased (capped): +{remaining:.2f}")
+                            continue
+
+                        # unphased contribution logic (capped aggregate below)
+                        contribution = 0.0
+                        if other_v.automated_class == "Pathogenic":
+                            contribution = 0.5
+                            criteria_details.append(f"unphased with P ({other_v.hgvsp}): +0.5")
+                        elif other_v.automated_class == "Likely pathogenic":
+                            contribution = 0.5
+                            criteria_details.append(f"unphased with LP ({other_v.hgvsp}): +0.5")
+
+                        # cap unphased contributions at 1.0 per original design
+                        if unphased_contributions + contribution <= 1.0:
+                            unphased_contributions += contribution
+                            pm3_score += contribution
+                        elif unphased_contributions < 1.0:
+                            remaining = 1.0 - unphased_contributions
+                            unphased_contributions += remaining
+                            pm3_score += remaining
+                            criteria_details.append(f"unphased (capped): +{remaining:.2f}")
+
+                    # ensure unphased_contributions does not exceed 1.0
                     if unphased_contributions > 1.0:
                         excess = unphased_contributions - 1.0
                         pm3_score -= excess
                         unphased_contributions = 1.0
+
+                    # Determine PM3 final assignment with policy:
+                    # - apply PM3 only if there is NO confirmed cis evidence for this variant
+                    # - maximum strength is Supporting when pm3_score >= 0.5
                     pm3_level = None
-                    if pm3_score >= 4.0:
-                        pm3_level = "PM3_VeryStrong"
-                    elif pm3_score >= 2.0:
-                        pm3_level = "PM3_Strong"
-                    elif pm3_score >= 1.0:
-                        pm3_level = "PM3_Moderate"
-                    elif pm3_score >= 0.5:
-                        pm3_level = "PM3_Supporting"
-                    has_parental_data = any(
-                        any(gt != "./." for gt in [v.father_gt, v.mother_gt])
-                        for v in varlist
-                    )
-                    if pm3_level and not has_parental_data:
-                        if pm3_level in ["PM3_Moderate", "PM3_Strong", "PM3_VeryStrong"]:
-                            old_level = pm3_level
+                    if cis_found_for_variant:
+                        # Do not apply PM3 if variant has any confirmed cis evidence
+                        v.manual_reasons.append("PM3 not applied: confirmed cis evidence detected with partner variant(s)")
+                    else:
+                        # apply PM3 Supporting if pm3_score >= 0.5 (this is the pipeline maximum)
+                        if pm3_score >= 0.5:
                             pm3_level = "PM3_Supporting"
-                            v.manual_reasons.append(f"PM3 downgraded from {old_level} to {pm3_level} (no parental phasing)")
+                        else:
+                            pm3_level = None
+
+                    # Apply PM3_Supporting to variant record if appropriate and not already present
                     if pm3_level and pm3_level not in v.criteria_assigned:
                         v.criteria_assigned.append(pm3_level)
                         v.criteria_points[pm3_level] = POINTS_MAP.get(pm3_level, 1)
@@ -3967,7 +4249,9 @@ class ACMGEngine:
                             v.manual_reasons.append(f"PM3 ({pm3_level}): total={pm3_score:.2f} [{details_str}]")
                         else:
                             v.manual_reasons.append(f"PM3 ({pm3_level}): total={pm3_score:.2f}")
-                    if pm3_score > 0 and has_parental_data:
+
+                    # annotate phase field for downstream triage (trans/cis/mixed/unknown)
+                    try:
                         trans_found = False; cis_found = False
                         for other_v in varlist:
                             if other_v is v: continue
@@ -3983,6 +4267,8 @@ class ACMGEngine:
                             v.phase = "mixed"
                         else:
                             v.phase = "unknown"
+                    except Exception:
+                        v.phase = getattr(v, "phase", "unknown")
 
 # ---------------------------
 # Deduplication helper
@@ -4040,58 +4326,60 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
     """
     Detect potential delins (complex adjacent indels) by clustering nearby variants.
 
-    Behavior (updated):
+    Revised behavior:
       - Build clusters as connected components of nearby variants (within ADJ_THRESHOLD bp).
       - Only mark is_delins_part = True for variants in a cluster if the cluster contains at least
-        one Pathogenic/Likely-pathogenic (or is_hq_pathogenic_db == True) variant.
+        one Pathogenic/Likely-pathogenic variant that is in the SAME GENE as the candidate variant.
+        (We require gene concordance to avoid flagging variants in a gene because of a P/LP in a different gene.)
       - For marking an individual variant as is_delins_part, compute the minimal genomic distance
-        from that variant to any Pathogenic member of the same cluster, and require that distance
-        be <= ADJ_THRESHOLD (i.e., distance is measured to pathogenic variant(s), not to VUS).
-      - Phasing evidence (cis/trans) is still recorded and included in manual_reasons to help curators.
-      - If a cluster contains no P/LP, do not flag any member as delins_part; instead add audit notes.
+        from that variant to any Pathogenic member of the same gene in the same cluster, and require
+        that distance to be <= ADJ_THRESHOLD.
+      - If a cluster contains P/LP variants only in other genes, do NOT flag any member as delins_part;
+        instead add an explanatory audit note.
+      - Benign variants are filtered out and not flagged as delins parts.
+      - Phasing evidence (cis/trans) is recorded in manual_reasons as before.
     """
     def key_of(v: VariantRecord) -> str:
         return f"{v.chrom}:{v.pos}:{v.ref}:{v.alt}:{v.sample}"
-    
+
     def _is_benign_variant(v: VariantRecord) -> bool:
         """
-        Check if variant is benign based on multiple criteria:
-        - automated_class is Benign/Likely benign
-        - High-quality ClinVar benign (>=2 stars)
-        - HGMD benign classes with support
-        - Strong negative points total
+        Conservative check whether a variant is benign enough to be ignored in delins detection.
         """
-        # 1. Check automated_class
-        if getattr(v, "automated_class", "") in ("Benign", "Likely benign"):
-            return True
-        
-        # 2. Check ClinVar high-quality benign
+        # 1. Automated class
+        try:
+            if getattr(v, "automated_class", "") in ("Benign", "Likely benign"):
+                return True
+        except Exception:
+            pass
+
+        # 2. ClinVar high-quality benign (>=2 stars)
         try:
             if getattr(v, "clinvar_stars", "") and str(v.clinvar_stars).isdigit() and int(v.clinvar_stars) >= 2:
-                sig = str(getattr(v, "clinvar_sig", "")).lower()
+                sig = str(getattr(v, "clinvar_sig", "") or "").lower()
                 if ("benign" in sig and "pathogen" not in sig) or ("likely benign" in sig):
                     return True
         except Exception:
             pass
-        
-        # 3. Check HGMD benign classes (DP, FP, DFP) with publication support
+
+        # 3. HGMD benign classes with support
         try:
-            hgmd_class = str(getattr(v, "hgmd_class", "")).upper()
+            hgmd_class = str(getattr(v, "hgmd_class", "") or "").upper()
             if hgmd_class in ("DP", "FP", "DFP"):
                 pubs = int(getattr(v, "hgmd_publication_count", 0) or 0)
                 if pubs >= 2:
                     return True
         except Exception:
             pass
-        
-        # 4. Check total points (strong negative score)
+
+        # 4. Strong negative points
         try:
             total_points = int(getattr(v, "total_points", 0) or 0)
-            if total_points <= -4:  # Strong Benign threshold
+            if total_points <= -4:
                 return True
         except Exception:
             pass
-        
+
         return False
 
     # Group by sample and chromosome
@@ -4124,8 +4412,7 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
             return None
         parts = gt.split('|')
         try:
-            count_ones = parts.count('1')
-            if count_ones == 1:
+            if parts.count('1') == 1:
                 return parts.index('1')
             for idx, p in enumerate(parts):
                 if str(p) == '1':
@@ -4141,7 +4428,7 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
             if len(varlist) < 2:
                 continue
 
-            # Compute approximate span for a variant using ref length
+            # Compute approximate genomic span for a variant using ref length
             def _span(v: VariantRecord):
                 try:
                     s = int(v.pos)
@@ -4199,6 +4486,9 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                 if not comp_vars:
                     continue
 
+                cluster_counter += 1
+                member_str = ";".join(comp_keys)
+
                 # Evaluate phasing inside component
                 any_phased = False
                 any_cis = False
@@ -4218,9 +4508,6 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                                 any_trans = True
                                 phasing_pairs.append((a, b, "trans"))
 
-                cluster_counter += 1
-                member_str = ";".join(comp_keys)
-
                 # Identify pathogenic members in this cluster (Pathogenic/LP or high-quality DB pathogenic)
                 pathogenic_members = []
                 for vv in comp_vars:
@@ -4230,7 +4517,7 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                     except Exception:
                         continue
 
-                # If component has no pathogenics -> do not mark delins parts. Add audit notes instead.
+                # If component has no pathogenics -> do not mark delins parts. Add audit notes.
                 if not pathogenic_members:
                     for vv in comp_vars:
                         note = (f"Cluster id={cluster_counter} detected (members={member_str}) - no Pathogenic/LP present; "
@@ -4243,13 +4530,50 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                         vv.is_delins_part = False
                     continue
 
-                # Compute minimal distance from each variant to the nearest pathogenic member
-                def _min_dist_to_path(vv: VariantRecord, path_list: List[VariantRecord]) -> int:
+                # Build helper: for each candidate variant, select pathogenic members that belong to SAME GENE (normalized)
+                path_genes = set()
+                for p in pathogenic_members:
+                    try:
+                        path_genes.add(normalize_gene_name(getattr(p, "gene", "") or getattr(p, "gene_raw", "")))
+                    except Exception:
+                        pass
+
+                # If there are pathogenic members but none share any gene with cluster members,
+                # treat the cluster as informational only (do not flag). Record explanatory notes.
+                # We'll decide per-variant using same-gene pathogenic subset.
+                any_same_gene_pathogenic = False
+                for vv in comp_vars:
+                    try:
+                        vv_gene_norm = normalize_gene_name(getattr(vv, "gene", "") or getattr(vv, "gene_raw", ""))
+                        if vv_gene_norm and vv_gene_norm in path_genes:
+                            any_same_gene_pathogenic = True
+                            break
+                    except Exception:
+                        continue
+
+                if not any_same_gene_pathogenic:
+                    # There are pathogenic members but in different gene(s); do not flag as delins_part.
+                    for vv in comp_vars:
+                        note = (f"Cluster id={cluster_counter} contains Pathogenic variant(s) in other gene(s) "
+                                f"{sorted(list(path_genes))}; no same-gene P/LP -> delins NOT flagged for members.")
+                        if note not in vv.manual_reasons:
+                            vv.manual_reasons.append(note)
+                        vv._delins_cluster_id = cluster_counter
+                        vv._delins_cluster_members = comp_keys.copy()
+                        vv._delins_flag = False
+                        vv.is_delins_part = False
+                    continue
+
+                # Compute minimal distance from each variant to pathogenic members in the SAME gene,
+                # and mark as delins_part only when <= ADJ_THRESHOLD and variant is not benign.
+                def _min_dist_to_path_same_gene(vv: VariantRecord, path_list: List[VariantRecord]) -> int:
                     try:
                         p = int(vv.pos)
                         dmin = None
                         for pm in path_list:
                             try:
+                                if normalize_gene_name(pm.gene or pm.gene_raw) != normalize_gene_name(vv.gene or vv.gene_raw):
+                                    continue
                                 pp = int(pm.pos)
                                 d = abs(pp - p)
                                 if dmin is None or d < dmin:
@@ -4260,32 +4584,39 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                     except Exception:
                         return 9999999
 
-                # Mark as delins_part only those variants within ADJ_THRESHOLD bp from any Pathogenic
+                # Now process each member: filter benign, compute min distance to same-gene pathogenics and flag accordingly
                 for vv in comp_vars:
-                    # FIRST: Check if variant is benign - if so, filter it out completely
+                    # Filter benign variants completely (not flagged)
                     if _is_benign_variant(vv):
-                        # Benign variant - filter it out, do NOT mark as delins_part
                         vv._delins_flag = False
                         vv._delins_cluster_id = cluster_counter
                         vv._delins_cluster_members = comp_keys.copy()
                         vv.is_delins_part = False
-                        
-                        # Add clear explanation for filtering
                         benign_note = (f"Filtered: Benign variant in delins cluster (cluster_id={cluster_counter}) - "
-                                      f"not reported despite proximity to pathogenic variants")
+                                    f"not reported despite proximity to pathogenic variants")
                         if benign_note not in vv.manual_reasons:
                             vv.manual_reasons.append(benign_note)
-                        
-                        # Ensure variant is marked as filtered
                         vv._filtered = True
+                        vv._exclude_from_reports = True
+                        # ensure not included in auto/manual lists downstream
                         vv._in_auto = False
                         vv._in_manual = False
-                        
-                        # Skip rest of processing for this variant
                         continue
-                    
-                    # For non-benign variants, proceed with normal delins detection
-                    dist = _min_dist_to_path(vv, pathogenic_members)
+
+                    # find same-gene pathogenic members for this variant
+                    same_gene_paths = [p for p in pathogenic_members if normalize_gene_name(p.gene or p.gene_raw) == normalize_gene_name(vv.gene or vv.gene_raw)]
+                    if not same_gene_paths:
+                        # no same-gene pathogenic partner for this vv -> do not flag
+                        vv._delins_flag = False
+                        vv._delins_cluster_id = cluster_counter
+                        vv._delins_cluster_members = comp_keys.copy()
+                        vv.is_delins_part = False
+                        note = (f"Cluster id={cluster_counter} contains P/LP but none in the same gene as this variant ({vv.gene or vv.gene_raw}) -> not flagged")
+                        if note not in vv.manual_reasons:
+                            vv.manual_reasons.append(note)
+                        continue
+
+                    dist = _min_dist_to_path_same_gene(vv, same_gene_paths)
                     if dist <= ADJ_THRESHOLD:
                         vv._delins_flag = True
                         vv._delins_cluster_id = cluster_counter
@@ -4295,18 +4626,16 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                         for (p1, p2, rel) in phasing_pairs:
                             pair_notes.append(f"{p1.chrom}:{p1.pos}-{p2.chrom}:{p2.pos}:{rel}")
                         note = (f"Delins cluster (cluster_id={cluster_counter}; members={member_str}); "
-                                f"nearest Pathogenic distance={dist}bp; phasing evidence: {', '.join(pair_notes) if pair_notes else 'none'}")
+                                f"nearest same-gene Pathogenic distance={dist}bp; phasing evidence: {', '.join(pair_notes) if pair_notes else 'none'}")
                         if note not in vv.manual_reasons:
                             vv.manual_reasons.append(note)
-                        
-                        # Note: _in_manual flag will be set later in triage based on is_delins_part
                     else:
                         vv._delins_flag = False
                         vv._delins_cluster_id = cluster_counter
                         vv._delins_cluster_members = comp_keys.copy()
                         vv.is_delins_part = False
-                        note = (f"Cluster id={cluster_counter} contains Pathogenic member(s) but this variant is {dist}bp away "
-                                f"from nearest Pathogenic (> {ADJ_THRESHOLD}bp) -> not flagged as delins_part")
+                        note = (f"Cluster id={cluster_counter} contains Pathogenic member(s) in same gene but this variant is {dist}bp away "
+                                f"from nearest same-gene Pathogenic (> {ADJ_THRESHOLD}bp) -> not flagged as delins_part")
                         if note not in vv.manual_reasons:
                             vv.manual_reasons.append(note)
 
@@ -4315,7 +4644,6 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                     for (p1, p2, rel) in phasing_pairs:
                         if rel == "cis":
                             for vv in (p1, p2):
-                                # Only add CIS note if variant is not benign and is marked as delins_part
                                 if not _is_benign_variant(vv) and getattr(vv, "is_delins_part", False):
                                     cis_note = f"Phasing: confirmed CIS pair in cluster {cluster_counter} -> delins likely (cis evidence)"
                                     if cis_note not in vv.manual_reasons:
@@ -4684,12 +5012,57 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
 
     hgmd_info = "; ".join(hgmd_parts) if hgmd_parts else "Not provided"
 
-    # database summary (keep for backward compatibility)
+    # === Rules_applied: dedupe preserving order ===
+    raw_rules = getattr(v, "_rules_applied", []) or []
+    unique_rules = list(dict.fromkeys(raw_rules))
+    rules_applied_str = ";".join(unique_rules)
+
+    # === ClinVar outputs: use clinvar_submissions (ordered) if present ===
+    clin_subs = getattr(v, "clinvar_submissions", []) or []
+    clin_sigs = []
+    clin_phens = []
+    clin_stars_seq = []
+    for s in clin_subs:
+        sig = str(s.get("clinsig","")).strip()
+        phen = str(s.get("phenotype","")).strip()
+        star = str(int(s.get("stars", 0) or 0))
+        if sig and sig.lower() not in ("not provided", ".", "null"):
+            clin_sigs.append(sig)
+        if phen and phen.lower() not in ("not provided", ".", "null"):
+            clin_phens.append(phen)
+        clin_stars_seq.append(star)
+
+    # dedupe preserving order
+    def _uniq_preserve(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x in seen or x == "":
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
+
+    clin_sigs_u = _uniq_preserve(clin_sigs)
+    clin_phens_u = _uniq_preserve(clin_phens)
+    clin_stars_u = clin_stars_seq  # keep sequence corresponding to submissions; optionally dedupe if desired
+
+    clinvar_sig_field = ";".join(clin_sigs_u) if clin_sigs_u else (v.clinvar_sig or "Not provided")
+    clinvar_trait_field = ";".join(clin_phens_u) if clin_phens_u else (v.clinvar_trait or "Not provided")
+    clinvar_stars_field = ";".join(clin_stars_u) if clin_stars_u else (str(v.clinvar_stars) if v.clinvar_stars else "0")
+
+    # HGMD phenotype field (dedupe)
+    hgmd_ph = getattr(v, "hgmd_phen", "") or ""
+    hgmd_phenotype_info = ";".join(_uniq_preserve([p.strip() for p in (hgmd_ph or "").split(";") if p.strip()])) if hgmd_ph else "Not provided"
+
+    # database_summary: build from deduped clinvar and hgmd parts
     db_sum_parts = []
-    if clinvar_info and clinvar_info != "Not provided":
-        db_sum_parts.append(f"ClinVar: {clinvar_info}")
-    if hgmd_info and hgmd_info != "Not provided":
-        db_sum_parts.append(f"HGMD: {hgmd_info}")
+    if clinvar_sig_field and clinvar_sig_field != "Not provided":
+        db_sum_parts.append(f"ClinVar: Sig={clinvar_sig_field}")
+    if clinvar_trait_field and clinvar_trait_field != "Not provided":
+        db_sum_parts.append(f"ClinVar: Trait={clinvar_trait_field}")
+    if hgmd_ph and hgmd_ph != "":
+        db_sum_parts.append(f"HGMD: Phen={hgmd_phenotype_info}")
     if v.internal_db_sig:
         db_sum_parts.append(f"Internal: {v.internal_db_sig}")
     db_summary = "; ".join(db_sum_parts) if db_sum_parts else "No database evidence"
@@ -4755,14 +5128,18 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "Sample_AF": sample_af_val,
         "acmg_disease_association": acmg_disease,
         "Special_Guidance": has_guidance,
-        "Rules_applied": ";".join(getattr(v, "_rules_applied", [])) if getattr(v, "_rules_applied", None) else "",
-        "clinvar_phenotype_match": clinvar_match_field,
-        "hgmd_phenotype_match": hgmd_match_field,
-        "clinvar_phenotype_info": clinvar_info,
-        "hgmd_phenotype_info": hgmd_info,
-        "clinvar_trait": v.clinvar_trait or "Not provided",
-        "clinvar_sig": v.clinvar_sig or "Not provided",
-        "clinvar_stars": v.clinvar_stars,
+        "Rules_applied": rules_applied_str,
+        "clinvar_phenotype_match": "Yes" if getattr(v, "_clinvar_phenotype_match", False) else "No",
+        "clinvar_phenotype_match_level": getattr(v, "_clinvar_phenotype_match_level", "") or "",
+        "clinvar_phenotype_match_reason": getattr(v, "_clinvar_phenotype_match_reason", "") or "",
+        "clinvar_phenotype_info": clinvar_trait_field,
+        "hgmd_phenotype_info": hgmd_phenotype_info,
+        "hgmd_phenotype_match": "Yes" if getattr(v, "_hgmd_phenotype_match", False) else "No",
+        "hgmd_phenotype_match_level": getattr(v, "_hgmd_phenotype_match_level", "") or "",
+        "hgmd_phenotype_match_reason": getattr(v, "_hgmd_phenotype_match_reason", "") or "",
+        "clinvar_trait": clinvar_trait_field,
+        "clinvar_sig": clinvar_sig_field,
+        "clinvar_stars": clinvar_stars_field,
         "hgmd_class": v.hgmd_class or "Not provided",
         "hgmd_phenotype": hgmd_phen or "Not provided",
         "hgmd_publication_count": v.hgmd_publication_count,
@@ -5187,13 +5564,12 @@ def strict_triage_and_output(
 
     def evaluate_gene_rules_for_variant(rules_text: Optional[str], vr: VariantRecord) -> Tuple[str, List[str]]:
         """
-        Evaluate gene-specific rule block (from ACMG_SF table 'Rules' column) against a variant.
-        The rules text may contain multiple lines with Include/Exclude conditions.
-
-        Returns:
-            Tuple[str, List[str]]: (decision, matched_rules)
-            - decision: "exclude", "include", or "no_match"
-            - matched_rules: List of rule lines that triggered the decision.
+        Evaluate gene-specific rule block against a variant and return decision + matched rule lines.
+        - Returns ("exclude" | "include" | "no_match", matched_rules_list)
+        - matched_rules_list contains the actual rule lines that matched (or the include-rule lines
+          present in the rules_text when none matched but include-lines were defined).
+        This behavior ensures the 'Rules_applied' output explicitly shows which Include/Exclude lines
+        were present in the table (helpful for auditing why a variant was excluded by whitelist logic).
         """
         if not rules_text:
             return "no_match", []
@@ -5202,20 +5578,23 @@ def strict_triage_and_output(
         matched_excludes = []
         matched_includes = []
         include_lines_present = False
+        include_lines_collected = []
 
         for line in lines:
             line_strip = line.strip()
             if not line_strip:
                 continue
-            # detect whether this is Include or Exclude rule
+
+            # detect Include / Exclude prefix (case-insensitive)
             is_excl = bool(re.match(r'^\s*Exclude\s+if', line_strip, flags=re.I))
             is_incl = bool(re.match(r'^\s*Include\s+if', line_strip, flags=re.I))
 
-            # record presence of explicit Include-lines (used for whitelist semantics)
+            # collect explicit include lines for later reporting (even if not matched)
             if is_incl:
                 include_lines_present = True
+                include_lines_collected.append(line_strip)
 
-            # Evaluate rule match
+            # Evaluate whether this rule triggers for the variant
             triggers = _evaluate_single_rule(line_strip, vr)
             if triggers:
                 if is_excl:
@@ -5223,31 +5602,34 @@ def strict_triage_and_output(
                 elif is_incl:
                     matched_includes.append(line_strip)
                 else:
-                    # If rule line doesn't start with Include/Exclude, try to interpret presence of 'Exclude' / 'Include' words
+                    # Ambiguous rule header: try to interpret
                     if 'exclude' in line_strip.lower():
                         matched_excludes.append(line_strip)
                     elif 'include' in line_strip.lower():
                         matched_includes.append(line_strip)
                     else:
-                        # ambiguous default: treat as include if matched
+                        # treat as include by default if it matched
                         matched_includes.append(line_strip)
 
         # Exclude rules have precedence: any matched exclude -> exclude
         if matched_excludes:
             return "exclude", matched_excludes
+
         # If at least one include matched -> include
         if matched_includes:
             return "include", matched_includes
 
-        # IMPORTANT: If the rules block contained explicit Include-lines but none matched,
-        # treat this as a whitelist and exclude the variant (conservative policy).
+        # If explicit include-lines were present but none matched, return the include-lines
+        # as the matched_rules so the output shows the exact whitelist entries that were required.
         if include_lines_present and not matched_includes:
-            # return an explanatory matched_rules list so caller can log it
-            return "exclude", ["No include rule matched; rules require explicit inclusion (whitelist)"]
+            # Prepend an explanatory line and include all include-lines present so user sees them
+            explanation = "No include rule matched; rules require explicit inclusion (whitelist)"
+            # Return the explanation plus the actual include lines from the rules block
+            return "exclude", [explanation] + include_lines_collected
 
-        # otherwise, no decisive rule triggered
+        # Otherwise, no decisive rule triggered
         return "no_match", []
- 
+
     def _db_high_quality_consensus(v: VariantRecord) -> Tuple[Optional[str], List[Dict[str,str]], bool, Optional[str]]:
         """
         Determine high-quality database consensus for a variant.
@@ -6209,22 +6591,26 @@ def strict_triage_and_output(
                         auto_ids.discard(get_key(v))
                         continue
 
-                # Case A: HQ DB-driven automatic (reworked to ignore single-DB gene-mismatch and to defer AR-het manualization)
+                # --- NEW POLICY: suppress immediate triage (auto/manual) for HQ DB consensus ---
+                # If a variant has high-quality DB evidence (is_hq_pathogenic_db), do NOT
+                # send it to auto_report or manual_review at this stage based solely on that consensus.
+                # Instead mark it as 'hq_db_consensus_suppressed' and continue pipeline so that
+                # later PP5ext/BP5ext scoring (computed earlier in evaluate_variant) can decide.
+
                 if getattr(v, "is_hq_pathogenic_db", False):
-                    # Detect per-source gene-mismatch flags recorded earlier in v.manual_reasons
+                    # detect per-source gene-mismatch flags (if present)
                     clinvar_mismatch = any("clinvar gene mismatch" in (r or "").lower() for r in v.manual_reasons)
                     hgmd_mismatch = any("hgmd gene mismatch" in (r or "").lower() for r in v.manual_reasons)
                     internal_mismatch = any("internal db" in (r or "").lower() and "gene mismatch" in (r or "").lower() for r in v.manual_reasons)
 
-                    # Determine HQ consensus and raw sources (original)
+                    # compute consensus info for auditing (use existing helper)
                     db_class, db_sources, consensus_flag, conflict_detail = _db_high_quality_consensus(v)
 
-                    # If there were gene-mismatch notes, filter out corresponding DB sources and re-evaluate consensus
+                    # If gene-mismatch flags exist, recompute filtered consensus for audit (same logic as before)
                     if (clinvar_mismatch or hgmd_mismatch or internal_mismatch) and db_sources:
                         filtered_sources = []
                         for s in db_sources:
                             sname = (s.get("source") or "").lower()
-                            # skip the source if it was flagged as gene-mismatch
                             if clinvar_mismatch and "clinvar" in sname:
                                 continue
                             if hgmd_mismatch and "hgmd" in sname:
@@ -6232,75 +6618,57 @@ def strict_triage_and_output(
                             if internal_mismatch and ("internal" in sname or "internal_db" in sname or "internal_db_display" in sname):
                                 continue
                             filtered_sources.append(s)
-
-                        # Recompute HQ consensus from filtered_sources using same HQ logic as _db_high_quality_consensus
-                        # Only consider ClinVar (already HQ-filtered by stars) and HGMD entries with norm == "Pathogenic" as HQ
-                        hq_norms = []
-                        hq_sources_filtered = []
-                        for s in filtered_sources:
-                            src = s.get("source", "")
-                            norm = s.get("norm", "")
-                            # Mark HQ: ClinVar entries included, and HGMD entries normalized as Pathogenic
-                            if "clinvar" in (src or "").lower():
-                                hq_sources_filtered.append(s); hq_norms.append(norm)
-                            elif "hgmd" in (src or "").lower() and str(norm).lower().startswith("pathogen"):
-                                hq_sources_filtered.append(s); hq_norms.append("Pathogenic")
-                            # Internal DB is not considered HQ in original logic unless explicitly desired -> skip as HQ
-
-                        # derive new consensus info
-                        if not hq_sources_filtered:
-                            # no HQ sources remain after excluding mismatched DB -> do not auto-consensus, fall back to algorithmic scoring
-                            consensus_flag = False
-                            db_class = None
-                            conflict_detail = None
-                        else:
+                        # re-evaluate a simple consensus summary for audit
+                        if filtered_sources:
+                            hq_norms = []
+                            for s in filtered_sources:
+                                src = s.get("source", "")
+                                norm = s.get("norm", "")
+                                if "clinvar" in (src or "").lower():
+                                    hq_norms.append(norm)
+                                elif "hgmd" in (src or "").lower() and str(norm).lower().startswith("pathogen"):
+                                    hq_norms.append("Pathogenic")
                             unique = set([str(x).strip() for x in hq_norms if x])
                             if len(unique) == 1:
                                 db_class = list(unique)[0]
                                 consensus_flag = True
                                 conflict_detail = None
-                            elif unique == {"Pathogenic", "Likely pathogenic"} or unique == {"Likely pathogenic", "Pathogenic"}:
-                                # mild disagreement -> conservative assignment to Pathogenic (as earlier)
+                            elif unique == {"Pathogenic", "Likely pathogenic"}:
                                 db_class = "Pathogenic"
                                 consensus_flag = True
                                 conflict_detail = "Mild disagreement among HQ sources (Pathogenic vs Likely pathogenic) after excluding mismatched DB"
                             else:
-                                # substantive conflict among remaining HQ sources -> manual
-                                db_class = None
                                 consensus_flag = False
-                                conflict_detail = "Conflict among remaining high-quality sources after excluding mismatched DB: " + "; ".join([f"{s.get('source')}='{s.get('raw')}'" for s in hq_sources_filtered])
-
-                    # After possible filtering & recomputation: act only if consensus_flag True
-                    if consensus_flag:
-                        # Determine effective MOI for gene-level rule (use rule-level MOI as fallback)
-                        v_moi = str(rule.get("moi", "") or "").upper()
-
-                        # If MOI suggests recessive and variant is heterozygous, DO NOT immediately send to manual:
-                        # first defer to phasing/pairing checks (will be handled later in AR-pairing stage).
-                        # Add informative note and proceed (do not set _in_manual here).
-                        if ("AR" in v_moi or "RECESSIVE" in v_moi) and not _is_hom(v.proband_gt):
-                            note = "Recessive inheritance suggested; heterozygous P/LP — pairing/phasing review required before reporting."
-                            if note not in v.manual_reasons:
-                                v.manual_reasons.append(note)
-                            # leave v._in_auto False for now; allow algorithmic path and AR pairing checks to consider this variant
-                            # do not continue / do not force manual assignment here
+                                db_class = None
+                                conflict_detail = "Conflict among remaining high-quality sources after excluding mismatched DB: " + "; ".join([f"{s.get('source')}='{s.get('raw')}'" for s in filtered_sources])
                         else:
-                            # For dominant / non-recessive MOI (or homozygotes), auto-assign per DB consensus
-                            v._in_auto = True
-                            v._filtered = False
-                            v.auto_report_reasons.append("HQ DB consensus")
-                            if conflict_detail:
-                                v.auto_report_reasons.append(f"HQ note: {conflict_detail}")
-                            auto_ids.add(get_key(v))
-                            # set automated_class to DB consensus if available
-                            if db_class:
-                                v.automated_class = db_class
-                            if not getattr(v, "criteria_points", None):
-                                v.criteria_points = {}
-                            try:
-                                v.total_points = sum(int(x) for x in v.criteria_points.values())
-                            except Exception:
-                                v.total_points = getattr(v, "total_points", 0)
+                            # if nothing left after filtering, clear consensus flags
+                            consensus_flag = False
+                            db_class = None
+                            conflict_detail = None
+
+                    # At this stage we DO NOT escalate the variant to auto or manual because of DB consensus alone.
+                    # Record an audit-friendly explanation in criteria_explanations (NOT in manual_reasons),
+                    # mark a suppression flag, and allow further algorithmic scoring (PP5ext etc.) to determine final triage.
+                    try:
+                        vr_key = getattr(v, "hgvsp", "") or f"{v.chrom}:{v.pos}:{v.ref}>{v.alt}"
+                        # store structured audit info on the variant (not used for triage)
+                        v._hq_db_consensus_suppressed = True
+                        v._hq_db_consensus_summary = {
+                            "db_class_suggested": db_class or "",
+                            "consensus_flag": bool(consensus_flag),
+                            "conflict_detail": conflict_detail or "",
+                            "db_sources": db_sources or []
+                        }
+                        # friendly single-line explanation for CSV/quick-audit
+                        expl = f"HQ_DB_consensus suppressed: suggested={db_class or 'N/A'}; consensus={bool(consensus_flag)}"
+                        if conflict_detail:
+                            expl += f"; note={conflict_detail}"
+                        # put this into criteria_explanations so it appears in per-criterion columns rather than forcing manual review
+                        v.criteria_explanations["HQ_DB_consensus_suppressed"] = expl
+                    except Exception:
+                        # fail silently for audit storage but do not affect triage flow
+                        pass
 
 
                 # Case B: Algorithmic scoring (Tavtigian et al., (2018))
@@ -7768,9 +8136,11 @@ def process_vcf(proband_vcf: str,
     except Exception as e:
         logger.debug("Simple-extract detection failed: %s", e)
 
-    # DB manager handles (parental VCFs) — pysam VariantFile if available
-    dad_vf = pysam.VariantFile(father_vcf) if father_vcf and os.path.exists(father_vcf) and HAVE_PYSAM else None
-    mom_vf = pysam.VariantFile(mother_vcf) if mother_vcf and os.path.exists(mother_vcf) and HAVE_PYSAM else None
+    # Do not keep parental pysam handles for trio-based fetch.
+    # Parents will be parsed separately as mono-samples (if separate VCFs provided),
+    # but we do not keep open handles for parental lookups to avoid trio logic.
+    dad_vf = None
+    mom_vf = None
 
     if use_simple_extract:
         # Use appropriate opener for gzipped or plain VCF regardless of filename extension
@@ -7817,7 +8187,136 @@ def process_vcf(proband_vcf: str,
        # Debug/force block removed. Fall back to cyvcf2/pysam reader below.
        pass    
 
+    # Parse a VCF-like file in "simple-extract" format and append VariantRecord objects
+    # for every sample column found in the file. This creates independent mono-sample VariantRecord
+    # entries even for parents' VCFs.
+    def parse_and_append_vcf_mono(vcf_path: str, candidates_list: List[VariantRecord],
+                                dbm_obj: Optional[DatabaseManager], inferred_sex_val: str,
+                                preferred_sample: Optional[str] = None):
+        """
+        Parse the provided VCF or annotated TSV (gz or plain). For every sample column present in the file
+        create a separate VariantRecord by using create_variant_from_extract_line(fields, sample_name=sample).
+        Annotate each record with gnomAD/DB evidence (using dbm_obj) and append to candidates_list.
+
+        This function intentionally treats each sample independently (mono-sample analysis).
+        """
+        import gzip
+
+        if not vcf_path or not os.path.exists(vcf_path):
+            return
+
+        openf = gzip.open if (str(vcf_path).endswith((".gz", ".bgz")) or is_gzipped(vcf_path)) else open
+
+        # read header and first data line to determine sample names
+        header_sample_line = None
+        first_data_line = None
+        try:
+            with openf(vcf_path, "rt", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    if ln.startswith("#CHROM"):
+                        header_sample_line = ln.rstrip("\n")
+                        # keep reading until data begins
+                        continue
+                    if not ln.startswith("#"):
+                        first_data_line = ln.rstrip("\n")
+                        break
+        except Exception:
+            # if header read fails, we will attempt a streaming parse below
+            header_sample_line = None
+
+        if header_sample_line:
+            header_parts = re.split(r'\t+', header_sample_line)
+            sample_names = header_parts[9:] if len(header_parts) > 9 else []
+        else:
+            # fallback to preferred_sample or a generic name
+            sample_names = [preferred_sample] if preferred_sample else ["sample"]
+
+        # Re-open and stream parse all data lines, creating a mono-VariantRecord per sample column
+        try:
+            with openf(vcf_path, "rt", encoding="utf-8", errors="ignore") as fh:
+                line_no = 0
+                for ln in fh:
+                    line_no += 1
+                    if ln.startswith("#"):
+                        continue
+                    ln = ln.rstrip("\r\n")
+                    if not ln:
+                        continue
+                    parts = re.split(r'\t+', ln)
+                    if len(parts) < 9:
+                        parts = ln.split()
+                    if len(parts) < 9:
+                        # skip malformed line
+                        continue
+
+                    num_samples_in_line = max(0, len(parts) - 9)
+                    # determine effective sample names for this line
+                    effective_sample_names = sample_names[:num_samples_in_line] if num_samples_in_line > 0 else sample_names
+
+                    # if no per-sample columns, still create one record for the preferred sample
+                    if num_samples_in_line == 0 and effective_sample_names:
+                        fp = list(parts)
+                        while len(fp) < 10:
+                            fp.append(".")
+                        try:
+                            vr = create_variant_from_extract_line(fp, sample_name=effective_sample_names[0])
+                        except Exception:
+                            continue
+                        vr.sample_sex = inferred_sex_val
+                        try:
+                            if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm_obj is not None:
+                                dbm_obj.annotate_gnomad_for_variant(vr)
+                        except Exception:
+                            pass
+                        try:
+                            if dbm_obj is not None:
+                                vr.db_hits.extend(dbm_obj.get_variant_db_evidence(vr))
+                        except Exception:
+                            pass
+                        candidates_list.append(vr)
+                        continue
+
+                    # iterate sample columns and create one VariantRecord per sample
+                    for si, sname in enumerate(effective_sample_names):
+                        sample_col_index = 9 + si
+                        if sample_col_index >= len(parts):
+                            continue
+                        fields_for_sample = list(parts[:9])  # CHROM..FORMAT
+                        fields_for_sample.append(parts[sample_col_index])
+                        try:
+                            vr = create_variant_from_extract_line(fields_for_sample, sample_name=sname or preferred_sample or f"sample_{si}")
+                        except Exception:
+                            continue
+                        vr.sample_sex = inferred_sex_val
+                        try:
+                            if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm_obj is not None:
+                                dbm_obj.annotate_gnomad_for_variant(vr)
+                        except Exception:
+                            pass
+                        try:
+                            if dbm_obj is not None:
+                                vr.db_hits.extend(dbm_obj.get_variant_db_evidence(vr))
+                        except Exception:
+                            pass
+                        candidates_list.append(vr)
+        except Exception:
+            # be resilient to I/O errors; caller will continue with whatever appended
+            return
+
     logger.info("DEBUG: parsed candidates count = %d", len(candidates))
+
+    # If separate parental VCF paths were provided, parse them as independent mono-samples
+    # and append their VariantRecord entries to the candidates list (parents are not treated as trio).
+    if father_vcf and os.path.exists(father_vcf):
+        logger.info("Parsing father VCF as mono-samples: %s", father_vcf)
+        parse_and_append_vcf_mono(father_vcf, candidates, dbm, inferred_sex, preferred_sample=None)
+
+    if mother_vcf and os.path.exists(mother_vcf):
+        logger.info("Parsing mother VCF as mono-samples: %s", mother_vcf)
+        parse_and_append_vcf_mono(mother_vcf, candidates, dbm, inferred_sex, preferred_sample=None)
+
+    # After appending parental files ensure deduplication will treat sample+coords as separate keys
+
     for i, vv in enumerate(candidates[:10]):
         try:
             logger.info("CAND[%d] gene=%s hgvsp=%s hgvsc=%s consequence=%s sample_gt=%s dp=%s af=%s gnomad_af=%s keys=%s",
