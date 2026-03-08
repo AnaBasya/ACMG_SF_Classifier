@@ -9,6 +9,9 @@
 /databases/*
 /databases/clinvar/clinvar.vcf.gz
 /databases/clinvar/clinvar.vcf.gz.tbi
+/databases/clinvar/clinvar_expanded.mane_filtered.csv
+/databases/clinvar/clinvar_expanded.csv
+/databases/clinvar/clinvar_with_protein.vcf.gz
 /databases/gnomad/*
 /batch_results/
 /batch_results/*
