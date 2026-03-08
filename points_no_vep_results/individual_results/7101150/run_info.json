@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-03-03T22:40:02Z",
-  "proband_vcf": "./data/batch_sql/39461_2023/7101150_proband.vcf",
-  "annotated_vcf": "./points_no_vep_results/individual_results/7101150/7101150_proband.acmg_only.vcf.gz",
+  "timestamp": "2026-03-08T01:24:17Z",
+  "proband_vcf": "./data/batch_sql/39461_2023/7101150.vcf",
+  "annotated_vcf": "./points_no_vep_results/individual_results/7101150/7101150.acmg_only.vcf.gz",
   "candidates_pre_qc": 259,
   "candidates_post_qc": 241,
   "dropped_pre_qc": 18,

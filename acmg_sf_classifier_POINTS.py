@@ -89,7 +89,7 @@ logger = logging.getLogger("acmg_sf_classifier")
 # ---------------------------
 DB_PATHS_DEFAULT = {
     "CLINVAR_VCF": "databases/clinvar/clinvar_with_protein.vcf.gz",
-    "CLINVAR_EXPANDED_CSV": "databases/clinvar/clinvar_expanded.csv" 
+    "CLINVAR_EXPANDED_CSV": "databases/clinvar/clinvar_expanded.mane_filtered.csv" 
 
 }
 
@@ -212,6 +212,7 @@ class VariantRecord:
     consequence: str = ""
     hgvsc: str = ""
     hgvsp: str = ""
+    tid: Optional[str] = ""
     exon: str = ""
     is_last_exon: bool = False
     nmd: Optional[str] = ""
@@ -301,6 +302,107 @@ def run_cmd(cmd: List[str], check=True, timeout: Optional[int] = None) -> subpro
 
 _RE_LEADING_TRAILING = re.compile(r'^[\s"\'`]+|[\s"\'`]+$')
 _RE_NON_ALNUM = re.compile(r'[^A-Za-z0-9_]')
+
+def _uniq_preserve(items):
+    """
+    Remove exact duplicates and empty strings while preserving order.
+    
+    Args:
+        items: List of items (strings)
+    
+    Returns:
+        List with duplicates removed, order preserved
+    """
+    out = []
+    seen = set()
+    for it in items:
+        if not it:
+            continue
+        s = str(it).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+def aggregate_clinvar_signatures(vr):
+    try:
+        _clin_sigs_all = []
+
+        # 1) from expanded submissions stored on variant record (vr.clinvar_submissions)
+        for s in getattr(vr, "clinvar_submissions", []) or []:
+            try:
+                cs = ""
+                if isinstance(s, dict):
+                    cs = str(s.get("clnsig", "") or "").strip()
+                else:
+                    cs = str(s or "").strip()
+                if not cs:
+                    continue
+                parts = re.split(r'[;,\|/]+', cs)
+                for p in parts:
+                    p2 = p.strip()
+                    if p2:
+                        _clin_sigs_all.append(p2)
+            except Exception:
+                continue
+
+        # 2) from any existing vr.clinvar_sig (e.g. earlier VCF-based lookup)
+        existing_sig = getattr(vr, "clinvar_sig", "") or ""
+        if existing_sig and str(existing_sig).strip() and str(existing_sig).strip().lower() not in ("not provided", ".", "null", "none"):
+            try:
+                parts = re.split(r'[;,\|/]+', str(existing_sig))
+                for p in parts:
+                    p2 = p.strip()
+                    if p2:
+                        _clin_sigs_all.append(p2)
+            except Exception:
+                pass
+
+        # Deduplicate preserving order (case-insensitive uniqueness, keep original case)
+        uniq = []
+        seen = set()
+        for item in _clin_sigs_all:
+            key = item.strip().lower()
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(item.strip())
+
+        # Final assignment
+        if uniq:
+            vr.clinvar_sig = ";".join(uniq)
+        else:
+            if existing_sig and existing_sig.strip() and existing_sig.strip().lower() not in ("not provided", ".", "null", "none"):
+                vr.clinvar_sig = existing_sig
+            else:
+                vr.clinvar_sig = "Not provided"
+    except Exception:
+        try:
+            if not getattr(vr, "clinvar_sig", None):
+                vr.clinvar_sig = "Not provided"
+        except Exception:
+            pass
+
+def get_sample_names_from_vcf_header(vcf_path: str) -> List[str]:
+    """
+    Extract sample names from VCF header.
+    """
+    samples = []
+    try:
+        opener = gzip.open if (str(vcf_path).endswith((".gz", ".bgz")) or is_gzipped(vcf_path)) else open
+        with opener(vcf_path, "rt", encoding="utf-8", errors="ignore") as fh:
+            for ln in fh:
+                if ln.startswith("#CHROM"):
+                    parts = re.split(r'\t+', ln.rstrip("\n"))
+                    if len(parts) > 9:
+                        samples = parts[9:]
+                    break
+    except Exception as e:
+        logger.warning(f"Could not extract sample names from {vcf_path}: {e}")
+    return samples
 
 def normalize_gene_name(g: str) -> str:
     if not g:
@@ -550,6 +652,8 @@ def create_variant_from_extract_line(fields: List[str], sample_name: str = "prob
     """
     fields expected: CHROM, POS, ID (vid), REF, ALT, QUAL, FILTER, INFO, FORMAT, SAMPLE
     This matches the SELECT ... produced by generate.py.
+    
+    IMPORTANT: sample_name is used as the sample identifier for this record.
     """
     # Basic columns
     chrom = fields[0]
@@ -561,12 +665,20 @@ def create_variant_from_extract_line(fields: List[str], sample_name: str = "prob
     fmt = fields[8] if len(fields) > 8 else ""
     sample_field = fields[9] if len(fields) > 9 else ""
 
-    vr = VariantRecord(chrom=normalize_chrom(chrom), pos=pos, ref=ref, alt=alt, sample=sample_name)
-
+    # CRITICAL: Use the provided sample_name, not trying to infer from file
+    vr = VariantRecord(
+        chrom=normalize_chrom(chrom), 
+        pos=pos, 
+        ref=ref, 
+        alt=alt, 
+        sample=sample_name   # Explicitly set from parameter
+    )
+    if not vr.sample or vr.sample.lower() in ("sample", "unknown", ""):
+        vr.sample = "proband"
     # parse INFO -> vr._raw_ann
     ann = parse_simple_info(info_raw)
     vr._raw_ann = ann
-
+    vr.tid = ann.get("TID") or ann.get("tid") or ann.get("TRANSCRIPT_ID") or vr.transcript or ""
     #  Extract sex from INFO field
     sample_sex = ann.get("SEX") or ann.get("Sex") or ann.get("sex") or ""
     if sample_sex:
@@ -616,12 +728,23 @@ def create_variant_from_extract_line(fields: List[str], sample_name: str = "prob
     except Exception:
         pass
     try:
-        # AlphaMissense key variants
-        if ann.get("ALPHAMISSENSE") is not None:
-            vr.alpha_missense = float(ann.get("ALPHAMISSENSE"))
-        elif ann.get("ALPHA_MISSENSE") is not None:
-            vr.alpha_missense = float(ann.get("ALPHA_MISSENSE"))
-    except Exception:
+        alpha_candidates = ["AlphaMissense", "ALPHAMISSENSE", "ALPHA_MISSENSE", "alpha_missense", 
+                           "ALPHA-MISSENSE", "AlphaMissense_score", "ALPHAMISSENSE_SCORE"]
+        
+        for alpha_key in alpha_candidates:
+            alpha_val = ann.get(alpha_key)
+            if alpha_val is not None:
+                alpha_str = str(alpha_val).strip()
+                if alpha_str and alpha_str.lower() not in ["", ".", "na", "none", "null"]:
+                    try:
+                        vr.alpha_missense = float(alpha_str)
+                        logger.debug(f"Parsed AlphaMissense={vr.alpha_missense} from key={alpha_key}")
+                        break
+                    except ValueError as ve:
+                        logger.debug(f"Failed to parse AlphaMissense value '{alpha_str}' as float: {ve}")
+                        continue
+    except Exception as e:
+        logger.debug(f"Failed to parse AlphaMissense: {e}")
         pass
     try:
         if ann.get("SPLICE_AI_SCORE") is not None:
@@ -1496,138 +1619,416 @@ class DatabaseManager:
 
     def _load_clinvar_expanded_csv(self, path: Optional[str]) -> None:
         """
-        Load clinvar_expanded.csv produced from submission_summary mapping.
+        Robust loader for clinvar_expanded CSV/TSV produced from submission_summary mapping.
         Builds:
         - self.clinvar_expanded_by_vid: {VariationID: [submission dicts]}
         - self.clinvar_expanded_by_qvar: {Query_Variant: [submission dicts]}
-        Each submission dict minimally: {'phenotype','clinsig','review','submission_id','hgvsp','gene','stars'}
+        Each submission dict minimally: {'phenotype','clnsig','review','submission_id','hgvsp','gene','stars'}
+        This loader is tolerant to different column names and fallback parsing (pandas or csv).
         """
         if not path or not os.path.exists(path):
+            logger.warning(f"ClinVar expanded CSV not found: {path}")
             return
-        try:
-            self.clinvar_expanded_by_vid = defaultdict(list)
-            self.clinvar_expanded_by_qvar = defaultdict(list)
-            if HAVE_PANDAS:
-                df = pd.read_csv(path, sep=';', dtype=str, encoding='utf-8', on_bad_lines='skip').fillna("")
-                cols = {c.lower(): c for c in df.columns}
-                qcol = cols.get('query_variant', 'Query_Variant')
-                vidcol = cols.get('variationid', 'VariationID')
-                phencol = cols.get('reportedphenotypeinfo', 'ReportedPhenotypeInfo')
-                sigcol = cols.get('clinicalsignificance', 'ClinicalSignificance')
-                revcol = cols.get('reviewstatus', 'ReviewStatus')
-                sidcol = cols.get('submissionid', 'SubmissionID')
-                hgvscol = cols.get('hgvs_protein', 'HGVS_Protein')
-                genecol = cols.get('genesymbol', 'GeneSymbol') if 'genesymbol' in cols or 'GeneSymbol' in df.columns else None
-                for _, r in df.iterrows():
-                    qv = str(r.get(qcol, "")).strip()
-                    vid = None
+        logger.info(f"Loading ClinVar expanded CSV: {path}")
+        self.clinvar_expanded_by_vid = defaultdict(list)
+        self.clinvar_expanded_by_qvar = defaultdict(list)
+
+        def normalize_review_to_stars(review_text: str) -> int:
+            if not review_text:
+                return 0
+            low = str(review_text).lower()
+            if 'practice_guideline' in low or 'practice guideline' in low:
+                return 4
+            if 'expert_panel' in low or 'expert panel' in low:
+                return 3
+            # heuristics for 2 stars: criteria_provided + multiple_submitters + no_conflict
+            if 'criteria_provided' in low and ('multiple_submitters' in low or 'multiple submitters' in low):
+                if 'no_conflict' in low or 'no conflict' in low or 'no_conflicts' in low:
+                    return 2
+                return 1
+            if 'criteria_provided' in low or 'criteria provided' in low:
+                return 1
+            return 0
+
+        def safe_first_nonempty(row, candidates):
+            """Return first non-empty value from row among candidate column names."""
+            for cand in candidates:
+                if not cand:
+                    continue
+                # pandas Series supports get(); csv.DictReader gives dict
+                try:
+                    if cand in row and row.get(cand) not in (None, "", ".", "NA", "None"):
+                        return str(row.get(cand)).strip()
+                except Exception:
                     try:
-                        vid = int(str(r.get(vidcol, "")).strip()) if str(r.get(vidcol, "")).strip() else None
+                        val = row.get(cand)
+                        if val not in (None, "", ".", "NA", "None"):
+                            return str(val).strip()
                     except Exception:
-                        vid = None
-                    phen = str(r.get(phencol, "") or "").strip()
-                    clnsig = str(r.get(sigcol, "") or "").strip()
-                    review = str(r.get(revcol, "") or "").strip()
-                    sid = str(r.get(sidcol, "") or "").strip()
-                    hgvsp = str(r.get(hgvscol, "") or "").strip()
-                    gene = str(r.get(genecol, "") or "").strip() if genecol else ""
-                    # compute stars from review text (same logic as elsewhere)
-                    stars = 0
-                    revl = review.lower()
-                    if 'practice_guideline' in revl:
-                        stars = 4
-                    elif 'expert_panel' in revl:
-                        stars = 3
-                    elif 'criteria_provided' in revl and 'multiple_submitters' in revl and 'no_conflict' in revl:
-                        stars = 2
-                    elif 'criteria_provided' in revl:
-                        stars = 1
-                    entry = {"phenotype": phen, "clinsig": clnsig, "review": review, "submission_id": sid,
-                            "hgvsp": hgvsp, "gene": gene, "stars": stars}
-                    if vid is not None:
-                        self.clinvar_expanded_by_vid[int(vid)].append(entry)
-                    if qv:
-                        self.clinvar_expanded_by_qvar[qv].append(entry)
-                        if qv.startswith("chr"):
-                            self.clinvar_expanded_by_qvar[qv.replace("chr","")].append(entry)
-                        else:
-                            self.clinvar_expanded_by_qvar["chr"+qv].append(entry)
-            else:
-                import csv
-                with open(path, "r", encoding='utf-8') as fh:
-                    reader = csv.DictReader(fh, delimiter=';')
-                    for r in reader:
-                        qv = str(r.get('Query_Variant', "")).strip()
+                        continue
+            return ""
+
+        # Try pandas first, but with robust candidate detection
+        try:
+            if HAVE_PANDAS:
+                df = pd.read_csv(path, sep=None, engine='python', dtype=str, on_bad_lines='skip').fillna("")
+                cols_lower = {c.lower().strip(): c for c in df.columns}
+                # heuristics for columns
+                def find_col(candidates):
+                    for c in candidates:
+                        if c and c.lower() in cols_lower:
+                            return cols_lower[c.lower()]
+                    # fuzzy substring
+                    for k in cols_lower:
+                        for cand in candidates:
+                            if cand and cand in k:
+                                return cols_lower[k]
+                    return None
+
+                qcol = find_col(['query_variant', 'queryvariant', 'qvar', 'query_var', 'Query_Variant'])
+                vidcol = find_col(['variationid', 'variation_id', 'variation id', 'variationid', 'VariationID'])
+                phencol = find_col(['reportedphenotypeinfo', 'reported_phenotype_info', 'phenotype', 'reportedphenotype', 'ReportedPhenotypeInfo'])
+                # significance candidates (order of preference)
+                sig_candidates = ['VCF_CLNSIG', 'VCF_CLINICAL_SIGNIFICANCE', 'ClinicalSignificance', 'clinsig', 'clnsig','clinical_significance', 'clinicalsignificance']
+                # review/status and other columns
+                revcol = find_col(['vcf_clnrevstat', 'reviewstatus', 'review_stat', 'review', 'ReviewStatus'])
+                sidcol = find_col(['submissionid', 'submission_id', 'submission', 'SubmissionID'])
+                hgvscol = find_col(['hgvs_protein', 'hgvs_prot', 'hgvsp', 'HGVS_Protein', 'protein'])
+                genecol = find_col(['genesymbol', 'gene', 'gene_symbol', 'symbol', 'GeneSymbol'])
+
+                for _, r in df.iterrows():
+                    try:
+                        # robust qvar extraction
+                        qv = ""
+                        if qcol:
+                            qv = str(r.get(qcol, "") or "").strip()
+                        if not qv:
+                            # check several common keys
+                            for cand in ('Query_Variant','query_variant','QueryVariant','qvar'):
+                                if cand in r and r.get(cand):
+                                    qv = str(r.get(cand)).strip(); break
+
                         vid = None
                         try:
-                            vid = int(str(r.get('VariationID', "")).strip()) if str(r.get('VariationID', "")).strip() else None
+                            vid_raw = r.get(vidcol, "") if vidcol else ""
+                            vid = int(str(vid_raw).strip()) if str(vid_raw).strip() else None
                         except Exception:
                             vid = None
-                        phen = str(r.get('ReportedPhenotypeInfo', "") or "").strip()
-                        clnsig = str(r.get('ClinicalSignificance', "") or "").strip()
-                        review = str(r.get('ReviewStatus', "") or "").strip()
-                        sid = str(r.get('SubmissionID', "") or "").strip()
-                        hgvsp = str(r.get('HGVS_Protein', "") or "").strip()
-                        gene = str(r.get('GeneSymbol', "") or "").strip()
-                        # compute stars
-                        stars = 0
-                        revl = review.lower()
-                        if 'practice_guideline' in revl:
-                            stars = 4
-                        elif 'expert_panel' in revl:
-                            stars = 3
-                        elif 'criteria_provided' in revl and 'multiple_submitters' in revl and 'no_conflict' in revl:
-                            stars = 2
-                        elif 'criteria_provided' in revl:
-                            stars = 1
-                        entry = {"phenotype": phen, "clinsig": clnsig, "review": review, "submission_id": sid,
-                                "hgvsp": hgvsp, "gene": gene, "stars": stars}
+
+                        phen = ""
+                        if phencol:
+                            phen = str(r.get(phencol, "") or "").strip()
+                        # clinical significance: try prioritized candidates, then scan keys
+                        clnsig = safe_first_nonempty(r, sig_candidates)
+                        if not clnsig:
+                            # fallback: scan all columns for 'clnsig'/'significance'
+                            for k in r.keys():
+                                kl = str(k).lower()
+                                if 'clnsig' in kl or 'significance' in kl:
+                                    val = r.get(k)
+                                    if val not in (None, "", ".", "NA", "None"):
+                                        clnsig = str(val).strip()
+                                        break
+
+                        # Review/status
+                        review = ""
+                        if revcol:
+                            review = str(r.get(revcol, "") or "").strip()
+                        if not review:
+                            # scan for likely review columns
+                            for cand in ('VCF_CLNREVSTAT','ReviewStatus','reviewstatus','review_stat','review'):
+                                if cand in r and r.get(cand):
+                                    review = str(r.get(cand)).strip(); break
+
+                        sid = str(r.get(sidcol, "") or "").strip() if sidcol else ""
+                        hgvsp = ""
+                        if hgvscol:
+                            hgvsp = str(r.get(hgvscol, "") or "").strip()
+                        gene = ""
+                        if genecol:
+                            gene = str(r.get(genecol, "") or "").strip()
+
+                        stars = normalize_review_to_stars(review)
+
+                        entry = {
+                            "phenotype": phen,
+                            "clnsig": clnsig,
+                            "review": review,
+                            "submission_id": sid,
+                            "hgvsp": hgvsp,
+                            "gene": gene,
+                            "stars": stars
+                        }
+
                         if vid is not None:
                             self.clinvar_expanded_by_vid[int(vid)].append(entry)
                         if qv:
                             self.clinvar_expanded_by_qvar[qv].append(entry)
+                            # also index with/without chr- prefix
                             if qv.startswith("chr"):
-                                self.clinvar_expanded_by_qvar[qv.replace("chr","")].append(entry)
+                                alt = qv.replace("chr", "", 1)
                             else:
-                                self.clinvar_expanded_by_qvar["chr"+qv].append(entry)
-            logger.info("Loaded clinvar_expanded: vids=%d qvars=%d", len(self.clinvar_expanded_by_vid), len(self.clinvar_expanded_by_qvar))
-        except Exception as e:
-            logger.warning("Failed to load clinvar_expanded CSV: %s", e)
+                                alt = "chr" + qv
+                            if alt != qv:
+                                self.clinvar_expanded_by_qvar[alt].append(entry)
+                            # also index by gene-specific key
+                            gene_norm = normalize_gene_name(gene) if gene else ""
+                            if gene_norm:
+                                key = f"{qv}|{gene_norm}"
+                                self.clinvar_expanded_by_qvar[key].append(entry)
+                                if alt != qv:
+                                    self.clinvar_expanded_by_qvar[f"{alt}|{gene_norm}"].append(entry)
+                    except Exception:
+                        continue
 
-    def get_submissions_for_query_variant(self, qvar: str) -> List[Dict[str,str]]:
-        """Return list of submission dicts for a query-variant string (robust against 'chr' prefix)."""
-        out = []
-        if not qvar:
-            return out
-        if hasattr(self, "clinvar_expanded_by_qvar"):
-            if qvar in self.clinvar_expanded_by_qvar:
-                out.extend(self.clinvar_expanded_by_qvar[qvar])
-            if qvar.startswith("chr"):
-                alt = qvar.replace("chr","")
-                out.extend(self.clinvar_expanded_by_qvar.get(alt, []))
-            else:
-                alt = "chr" + qvar
-                out.extend(self.clinvar_expanded_by_qvar.get(alt, []))
-        return out
+                # Deduplicate stored lists (by vid/qvar) preserving order
+                def dedupe_list(lst):
+                    seen = set(); out = []
+                    for s in lst:
+                        try:
+                            key = (str(s.get('submission_id','')), str(s.get('clnsig','')), str(s.get('phenotype','')), str(s.get('hgvsp','')))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            out.append(s)
+                        except Exception:
+                            continue
+                    return out
+
+                for k in list(self.clinvar_expanded_by_vid.keys()):
+                    self.clinvar_expanded_by_vid[k] = dedupe_list(self.clinvar_expanded_by_vid[k])
+                for k in list(self.clinvar_expanded_by_qvar.keys()):
+                    self.clinvar_expanded_by_qvar[k] = dedupe_list(self.clinvar_expanded_by_qvar[k])
+
+                logger.info(f"✓ Loaded ClinVar expanded CSV with pandas: {len(self.clinvar_expanded_by_vid)} by VariationID, {len(self.clinvar_expanded_by_qvar)} by Query_Variant")
+                return
+
+        except Exception as e:
+            logger.warning(f"Pandas parsing failed, trying fallback parser: {e}")
+
+        # Fallback parser (csv.DictReader with semicolon or tab) - robust fallback
+        try:
+            import csv
+            # try semicolon first, then tab/auto
+            tried = False
+            for delim in (';', '\t', ','):
+                try:
+                    with open(path, "r", encoding='utf-8', errors='replace') as fh:
+                        reader = csv.DictReader(fh, delimiter=delim)
+                        # if only one field name found with this delimiter, try next delimiter
+                        if reader.fieldnames is None or len(reader.fieldnames) <= 1:
+                            continue
+                        for r in reader:
+                            try:
+                                # robust qv
+                                qv = str(r.get('Query_Variant', "") or r.get('query_variant', "") or r.get('QueryVariant', "") or r.get(next(iter(r.keys())), "")).strip()
+                                vid = None
+                                try:
+                                    vid_raw = r.get('VariationID') or r.get('variationid') or r.get('Variation_Id') or ""
+                                    vid = int(str(vid_raw).strip()) if str(vid_raw).strip() else None
+                                except Exception:
+                                    vid = None
+                                phen = str(r.get('ReportedPhenotypeInfo', "") or r.get('reportedphenotypeinfo', "") or r.get('phenotype', "")).strip()
+
+                                # significance detection (robust)
+                                clnsig = ""
+                                for cand in ('VCF_CLNSIG', 'VCF_CLINICAL_SIGNIFICANCE', 'ClinicalSignificance', 'clinsig', 'clnsig', 'clinical_significance', 'clinicalsignificance'):
+                                    if cand in r and r.get(cand) not in (None, "", ".", "NA", "None"):
+                                        clnsig = str(r.get(cand)).strip()
+                                        break
+                                if not clnsig:
+                                    # search keys for 'clnsig' or 'significance'
+                                    for k in r.keys():
+                                        if 'clnsig' in k.lower() or 'significance' in k.lower():
+                                            val = r.get(k)
+                                            clnsig = str(val).strip() if val not in (None, "") else ""
+                                            if clnsig:
+                                                break
+
+                                review = ""
+                                for cand in ('VCF_CLNREVSTAT', 'ReviewStatus', 'reviewstatus', 'review_stat', 'review'):
+                                    if cand in r and r.get(cand):
+                                        review = str(r.get(cand)).strip(); break
+                                sid = str(r.get('SubmissionID', "") or r.get('submissionid', "") or "").strip()
+                                hgvsp = str(r.get('HGVS_Protein', "") or r.get('hgvs_protein', "") or r.get('HGVSp', "") or "").strip()
+                                gene = str(r.get('GeneSymbol', "") or r.get('genesymbol', "") or r.get('Gene', "") or "").strip()
+
+                                stars = normalize_review_to_stars(review)
+
+                                entry = {
+                                    "phenotype": phen,
+                                    "clnsig": clnsig,
+                                    "review": review,
+                                    "submission_id": sid,
+                                    "hgvsp": hgvsp,
+                                    "gene": gene,
+                                    "stars": stars
+                                }
+                                if vid is not None:
+                                    self.clinvar_expanded_by_vid[int(vid)].append(entry)
+                                if qv:
+                                    self.clinvar_expanded_by_qvar[qv].append(entry)
+                                    if qv.startswith("chr"):
+                                        alt_qv = qv.replace("chr","",1)
+                                    else:
+                                        alt_qv = "chr"+qv
+                                    if alt_qv != qv:
+                                        self.clinvar_expanded_by_qvar[alt_qv].append(entry)
+                                    gene_norm = normalize_gene_name(gene) if gene else ""
+                                    if gene_norm:
+                                        key = f"{qv}|{gene_norm}"
+                                        self.clinvar_expanded_by_qvar[key].append(entry)
+                                        if alt_qv != qv:
+                                            self.clinvar_expanded_by_qvar[f"{alt_qv}|{gene_norm}"].append(entry)
+                            except Exception:
+                                continue
+                    # If we reached here without exception for this delimiter, break
+                    tried = True
+                    break
+                except Exception:
+                    continue
+
+            # Deduplicate like above
+            def dedupe_list(lst):
+                seen = set(); out = []
+                for s in lst:
+                    try:
+                        key = (str(s.get('submission_id','')), str(s.get('clnsig','')), str(s.get('phenotype','')), str(s.get('hgvsp','')))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append(s)
+                    except Exception:
+                        continue
+                return out
+
+            for k in list(self.clinvar_expanded_by_vid.keys()):
+                self.clinvar_expanded_by_vid[k] = dedupe_list(self.clinvar_expanded_by_vid[k])
+            for k in list(self.clinvar_expanded_by_qvar.keys()):
+                self.clinvar_expanded_by_qvar[k] = dedupe_list(self.clinvar_expanded_by_qvar[k])
+
+            logger.info(f"Loaded ClinVar expanded CSV (fallback parser): vids={len(self.clinvar_expanded_by_vid)} qvars={len(self.clinvar_expanded_by_qvar)}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to load clinvar_expanded CSV with fallback parser: {e}", exc_info=True)
+            return
 
     def _get_expanded_submissions_for_variant(self, variation_id: Optional[int], qvar: Optional[str]) -> List[Dict]:
-        """Return deduplicated expanded submission dicts for a variant by VariationID and/or Query_Variant."""
+        """
+        Return deduplicated, ordered list of expanded ClinVar submission dicts for a variant.
+        Combines data from:
+        - self.clinvar_expanded_by_vid (VariationID -> [submissions])
+        - self.clinvar_expanded_by_qvar (Query_Variant -> [submissions])
+        Handles 'chr' prefix variance and deduplicates by (submission_id, clnsig, phenotype, hgvsp).
+        """
         out = []
-        if variation_id is not None and hasattr(self, "clinvar_expanded_by_vid"):
-            out.extend(self.clinvar_expanded_by_vid.get(int(variation_id), []))
-        if qvar and hasattr(self, "clinvar_expanded_by_qvar"):
-            out.extend(self.get_submissions_for_query_variant(qvar))
-        # dedupe by (submission_id, clinsig, phenotype, hgvsp)
-        seen = set()
-        uniq = []
-        for s in out:
-            key = (s.get("submission_id",""), s.get("clinsig",""), s.get("phenotype",""), s.get("hgvsp",""))
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(s)
-        return uniq
-    
+        try:
+            # Gather by VariationID if available
+            if variation_id is not None and hasattr(self, "clinvar_expanded_by_vid"):
+                try:
+                    out.extend(self.clinvar_expanded_by_vid.get(int(variation_id), []) or [])
+                except Exception:
+                    # defensive: ignore malformed vid
+                    pass
+
+            # Gather by Query_Variant if available
+            if qvar and hasattr(self, "clinvar_expanded_by_qvar"):
+                try:
+                    # direct key
+                    out.extend(self.clinvar_expanded_by_qvar.get(qvar, []) or [])
+                    # try w/o/with chr prefix
+                    if qvar.startswith("chr"):
+                        alt = qvar.replace("chr", "", 1)
+                    else:
+                        alt = "chr" + qvar
+                    if alt != qvar:
+                        out.extend(self.clinvar_expanded_by_qvar.get(alt, []) or [])
+                except Exception:
+                    pass
+
+            # If we still have no results but an alternative index exists (backwards compatibility),
+            # try to use any clinvar_submissions_by_qvar-like attribute if present.
+            # This keeps behavior robust if different loader sets a different attribute name.
+            if not out:
+                for attr in ("clinvar_submissions_by_qvar", "clinvar_expanded_by_qvar"):
+                    if hasattr(self, attr):
+                        try:
+                            idx = getattr(self, attr)
+                            if qvar in idx:
+                                out.extend(idx.get(qvar, []) or [])
+                            if qvar and qvar.startswith("chr") and qvar.replace("chr","") in idx:
+                                out.extend(idx.get(qvar.replace("chr",""), []) or [])
+                            if qvar and not qvar.startswith("chr") and ("chr" + qvar) in idx:
+                                out.extend(idx.get("chr" + qvar, []) or [])
+                        except Exception:
+                            continue
+
+            # Deduplicate preserving order
+            seen = set()
+            uniq = []
+            for s in out:
+                sid = str(s.get("submission_id", "") or "")
+                sig = str(s.get("clnsig", "") or "")
+                phen = str(s.get("phenotype", "") or "")
+                hgvsp = str(s.get("hgvsp", "") or "")
+                key = (sid, sig, phen, hgvsp)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(s)
+            return uniq
+        except Exception:
+            # On unexpected errors, return empty list but do not raise to keep pipeline running.
+            return []
+
+    def get_submissions_for_query_variant(self, qvar: str, variant_gene: Optional[str] = None) -> List[Dict[str,str]]:
+        """
+        Return list of submission dicts for a query-variant string (robust against 'chr' prefix).
+        If variant_gene is provided, prefer submissions annotated to that gene (indexed by "qvar|GENE").
+        Falls back to non-gene-specific submissions if no gene-specific entries found.
+        """
+        out: List[Dict[str,str]] = []
+        if not qvar:
+            return out
+
+        # 1) Try gene-specific key if variant_gene provided
+        try:
+            if variant_gene:
+                gene_norm = normalize_gene_name(variant_gene)
+                if gene_norm:
+                    key = f"{qvar}|{gene_norm}"
+                    if key in getattr(self, "clinvar_expanded_by_qvar", {}):
+                        out.extend(self.clinvar_expanded_by_qvar.get(key, []) or [])
+                        return out
+                    # try alt with/without chr prefix
+                    if qvar.startswith("chr"):
+                        alt = qvar.replace("chr", "", 1)
+                    else:
+                        alt = f"chr{qvar}"
+                    key_alt = f"{alt}|{gene_norm}"
+                    if key_alt in getattr(self, "clinvar_expanded_by_qvar", {}):
+                        out.extend(self.clinvar_expanded_by_qvar.get(key_alt, []) or [])
+                        return out
+        except Exception:
+            # on failure, fall back to positional lookup below
+            pass
+
+        # 2) Fallback: positional queries (existing behavior)
+        if hasattr(self, "clinvar_expanded_by_qvar"):
+            try:
+                out.extend(self.clinvar_expanded_by_qvar.get(qvar, []) or [])
+                # try with/without chr prefix
+                if qvar.startswith("chr"):
+                    alt_qv = qvar.replace("chr", "", 1)
+                else:
+                    alt_qv = f"chr{qvar}"
+                if alt_qv != qvar:
+                    out.extend(self.clinvar_expanded_by_qvar.get(alt_qv, []) or [])
+            except Exception:
+                pass
+
+        return out
+
 
     def _load_internal_db(self, path: str):
         if not os.path.exists(path):
@@ -1809,11 +2210,22 @@ class DatabaseManager:
         vr.is_hq_pathogenic_db = False
         vr.is_hq_benign_db = False
         vr.is_hq_conflict_db = False
-        vr.clinvar_submissions = []  # NEW: ordered list of expanded submission dicts for this variant
-        # CLINVAR (use expanded submissions when available; do NOT use VCF aggregate for phenotype/class/stars)
+        vr.clinvar_submissions = []
+        
+        # Initialize manual_reasons if needed
+        if not hasattr(vr, "manual_reasons") or vr.manual_reasons is None:
+            vr.manual_reasons = []
+        
+        # =====================
+        # CLINVAR (EXPANDED)
+        # =====================
         clinvar_evidence = []
+        clinvar_sigs_collected = []
+        clinvar_traits_collected = []
+        clinvar_stars_collected = []
+        
         try:
-            # Build qvar key from record if possible
+            # Build qvar key from record
             qvar = None
             try:
                 if getattr(vr, "chrom", None) and getattr(vr, "pos", None) and getattr(vr, "ref", None) is not None and getattr(vr, "alt", None) is not None:
@@ -1821,7 +2233,7 @@ class DatabaseManager:
             except Exception:
                 qvar = None
 
-            # try to get VariationID from raw annotations if present
+            # Get VariationID from annotations
             variation_id = None
             try:
                 for k in ("VARIATIONID","VAR_ID","VARID","ALLELEID"):
@@ -1836,37 +2248,298 @@ class DatabaseManager:
             except Exception:
                 variation_id = None
 
-            expanded = self._get_expanded_submissions_for_variant(variation_id, qvar) if (hasattr(self, 'clinvar_expanded_by_vid') or hasattr(self, 'clinvar_expanded_by_qvar')) else []
+            # Get expanded submissions; prefer those annotated to the same gene as the variant
+            expanded = []
+            try:
+                # by VariationID first (unchanged)
+                if variation_id is not None and hasattr(self, "clinvar_expanded_by_vid"):
+                    expanded.extend(self.clinvar_expanded_by_vid.get(int(variation_id), []) or [])
+            except Exception:
+                pass
+
+            # by Query_Variant, preferring same-gene submissions
+            try:
+                expanded_by_q = self.get_submissions_for_query_variant(qvar, variant_gene=vr.gene)
+                if expanded_by_q:
+                    expanded.extend(expanded_by_q)
+            except Exception:
+                # fallback: try to use raw qvar lookup if method failed
+                try:
+                    if hasattr(self, "clinvar_expanded_by_qvar"):
+                        expanded.extend(self.clinvar_expanded_by_qvar.get(qvar, []) or [])
+                        alt_qv = qvar.replace("chr", "", 1) if qvar.startswith("chr") else f"chr{qvar}"
+                        if alt_qv != qvar:
+                            expanded.extend(self.clinvar_expanded_by_qvar.get(alt_qv, []) or [])
+                except Exception:
+                    pass
+
+            def normalize_clnsig(raw_sig):
+                if not raw_sig:
+                    return ""
+                normalized = raw_sig.lower().replace('_', ' ')
+                normalized = ' '.join(normalized.split())
+                return normalized
 
             if expanded:
-                # Use only expanded submissions for clinvar evidence (phenotype-aware)
+                # Process expanded submissions
                 for s in expanded:
-                    s_sig = str(s.get("clinsig","") or "")
-                    s_rev = str(s.get("review","") or "")
-                    s_ph = str(s.get("phenotype","") or "")
-                    s_sid = str(s.get("submission_id","") or "")
-                    s_stars = int(s.get("stars", 0) or 0)
-                    # store ordered submission info on variant for downstream output
-                    vr.clinvar_submissions.append({"submission_id": s_sid, "clinsig": s_sig, "phenotype": s_ph, "review": s_rev, "stars": s_stars, "hgvsp": s.get("hgvsp","")})
-                    # interpret significance for evidence (for summary flags)
-                    s_sig_low = s_sig.lower()
-                    if "pathogenic" in s_sig_low and "likely" not in s_sig_low:
-                        clinvar_evidence.append(("Pathogenic", f"ClinVar_Submission_{s_stars}stars"))
-                        vr.has_strong_pathogenic_evidence = True
-                        vr.is_hq_pathogenic_db = True
-                    elif "likely pathogenic" in s_sig_low or ("likely" in s_sig_low and "pathogen" in s_sig_low):
-                        clinvar_evidence.append(("Likely pathogenic", f"ClinVar_Submission_{s_stars}stars"))
-                    elif "benign" in s_sig_low and "pathogen" not in s_sig_low:
-                        clinvar_evidence.append(("Benign", f"ClinVar_Submission_{s_stars}stars"))
-                        vr.has_strong_benign_evidence = True
-                        vr.is_hq_benign_db = True
+                    try:
+                        # normalize current HGVSp for exact-match allowance
+                        current_hgvsp_clean = clean_hgvsp(getattr(vr, "hgvsp", "") or "")
+
+                        s_sig = str(s.get("clnsig","") or "").strip()
+                        normalized_sig = normalize_clnsig(s_sig)
+                        s_rev = str(s.get("review","") or "").strip()
+                        s_ph = str(s.get("phenotype","") or "").strip()
+                        s_sid = str(s.get("submission_id","") or "").strip()
+                        s_stars = int(s.get("stars", 0) or 0)
+                        s_hgvsp = str(s.get("hgvsp","") or "").strip()
+                        s_gene = str(s.get("gene","") or "").strip()
+
+                        s_sig_norm = re.sub(r'[_\s]+', ' ', (s_sig or "").lower().strip())
+
+                        # gene validation
+                        gene_valid, gene_reason = validate_gene_match_db_evidence(vr.gene, s_gene, "ClinVar")
+                
+                        # Conflict detection 
+                        is_conflicting = bool(re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', s_sig_norm))
+                        
+                        if is_conflicting:
+                            clinvar_evidence.append(("Conflicting_classifications_of_pathogenicity", f"ClinVar_Submission_{s_stars}stars"))
+                            
+                            if not hasattr(vr, "_conflicting_submissions"):
+                                vr._conflicting_submissions = []
+                            vr._conflicting_submissions.append({
+                                "submission_id": s_sid,
+                                "clnsig": s_sig,
+                                "stars": s_stars,
+                                "phenotype": s_ph,
+                                "gene": s_gene
+                            })
+                            continue
+
+                        # Accept only if gene_valid OR (submission has HGVSp that exactly matches current HGVSp)
+                        s_hgvsp_clean = clean_hgvsp(s_hgvsp)
+                        if not gene_valid:
+                            if not s_hgvsp_clean or not current_hgvsp_clean or s_hgvsp_clean != current_hgvsp_clean:
+                                # skip and record for audit
+                                vr.manual_reasons.append(f"Skipped ClinVar submission {s_sid}: {gene_reason}")
+                                if not hasattr(vr, "_clinvar_submissions_skipped"):
+                                    vr._clinvar_submissions_skipped = []
+                                vr._clinvar_submissions_skipped.append({
+                                    "submission_id": s_sid,
+                                    "clnsig": normalized_sig,
+                                    "phenotype": s_ph,
+                                    "review": s_rev,
+                                    "stars": s_stars,
+                                    "hgvsp": s_hgvsp,
+                                    "gene": s_gene,
+                                    "note": "gene_mismatch_skipped"
+                                })
+                                continue
+                        # else: gene valid OR protein exact match -> accept
+                        vr.clinvar_submissions.append({
+                            "submission_id": s_sid,
+                            "clnsig": normalized_sig,
+                            "phenotype": s_ph,
+                            "review": s_rev,
+                            "stars": s_stars,
+                            "hgvsp": s_hgvsp,
+                            "gene": s_gene
+                        })
+
+                        try:
+                            # Aggregate clnsig values from accepted clinvar submissions (preserve order, dedupe case-insensitive)
+                            _clin_sigs_all = []
+                            _clin_stars_all = []
+
+                            for s in getattr(vr, "clinvar_submissions", []) or []:
+                                try:
+                                    cs = ""
+                                    if isinstance(s, dict):
+                                        cs = str(s.get("clnsig", "") or "").strip()
+                                        stars_val = s.get("stars", None)
+                                    else:
+                                        cs = str(s or "").strip()
+                                        stars_val = None
+                                    if cs:
+                                        parts = re.split(r'[;,\|/]+', cs)
+                                        for p in parts:
+                                            p2 = p.strip()
+                                            if p2:
+                                                _clin_sigs_all.append(p2)
+                                                # attach the submission's stars for the same token if present
+                                                try:
+                                                    if stars_val is not None:
+                                                        _clin_stars_all.append(str(int(stars_val)))
+                                                    else:
+                                                        _clin_stars_all.append("") 
+                                                except Exception:
+                                                    _clin_stars_all.append("")
+                                except Exception:
+                                    continue
+
+                            # fallback: if vr.clinvar_sig already contains tokens (e.g., from VCF lookup), include them
+                            existing_sig = getattr(vr, "clinvar_sig", "") or ""
+                            if existing_sig and str(existing_sig).strip() and str(existing_sig).strip().lower() not in ("not provided", ".", "null", "none"):
+                                try:
+                                    parts = re.split(r'[;,\|/]+', str(existing_sig))
+                                    for p in parts:
+                                        p2 = p.strip()
+                                        if p2:
+                                            _clin_sigs_all.append(p2)
+                                            _clin_stars_all.append(getattr(vr, "clinvar_stars", ""))
+                                except Exception:
+                                    pass
+
+                            # Deduplicate preserving order (case-insensitive for uniqueness but keep original case and align stars)
+                            uniq_sigs = []
+                            uniq_stars = []
+                            seen = set()
+                            for idx, item in enumerate(_clin_sigs_all):
+                                tok = (str(item or "")).strip()
+                                if not tok:
+                                    continue
+                                key = tok.lower()
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                uniq_sigs.append(tok)
+                                # align stars by index if available
+                                s_val = _clin_stars_all[idx] if idx < len(_clin_stars_all) else ""
+                                uniq_stars.append(str(s_val) if s_val not in (None, "None") else "")
+
+                            # If no signatures found, fall back to existing_sig handling below
+                            if not uniq_sigs:
+                                if existing_sig and existing_sig.strip() and existing_sig.strip().lower() not in ("not provided", ".", "null", "none"):
+                                    vr.clinvar_sig = existing_sig
+                                else:
+                                    vr.clinvar_sig = "Not provided"
+                                if not getattr(vr, "clinvar_stars", ""):
+                                    vr.clinvar_stars = "0"
+                            else:
+                                # Decide whether there are definitive tokens (pathogenic/likely pathogenic/benign/likely benign)
+                                def _is_definitive_label(s):
+                                    return bool(re.search(r'\b(pathogenic|likely\s+pathogenic|benign|likely\s+benign)\b', (s or "").lower()))
+                                has_definitive = any(_is_definitive_label(s) for s in uniq_sigs)
+
+                                filtered_sigs = []
+                                filtered_stars = []
+                                for s, st in zip(uniq_sigs, uniq_stars):
+                                    s_l = (s or "").lower()
+                                    # skip 'conflict' tokens only when definitive tokens exist
+                                    if has_definitive and re.search(r'\b(conflict|conflicting)\b', s_l):
+                                        continue
+                                    filtered_sigs.append(s)
+                                    # keep star for this signature only if non-empty
+                                    if st not in ("", None, "None"):
+                                        filtered_stars.append(st)
+
+                                # If filtering removed everything (e.g., only 'conflicting' tokens existed), keep original uniq list
+                                if not filtered_sigs:
+                                    final_sigs = uniq_sigs
+                                    final_stars = [s for s in uniq_stars if s not in ("", None, "None")]
+                                else:
+                                    final_sigs = filtered_sigs
+                                    final_stars = filtered_stars
+
+                                # Assign to variant record
+                                vr.clinvar_sig = ";".join(final_sigs) if final_sigs else "Not provided"
+                                if final_stars:
+                                    vr.clinvar_stars = ";".join(final_stars)
+                                else:
+                                    vr.clinvar_stars = getattr(vr, "clinvar_stars", "") or "0"
+
+                        except Exception:
+                            try:
+                                if not getattr(vr, "clinvar_sig", None):
+                                    vr.clinvar_sig = "Not provided"
+                                if not getattr(vr, "clinvar_stars", None):
+                                    vr.clinvar_stars = "0"
+                            except Exception:
+                                pass
+
+                        # Collect for aggregation ONLY if gene matched
+                        if s_sig:
+                            clinvar_sigs_collected.append(s_sig)
+                        if s_ph:
+                            clinvar_traits_collected.append(s_ph)
+                        clinvar_stars_collected.append(s_stars)
+
+                        # Interpret significance (only for validated submissions)
+
+                        # Conflict detection 
+                        if re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', s_sig_norm):
+                            clinvar_evidence.append(("Conflicting_classifications_of_pathogenicity", f"ClinVar_Submission_{s_stars}stars"))
+                        else:
+                            has_likely = bool(re.search(r'\blikely\s+pathogenic\b', s_sig_norm))
+                            has_path = bool(re.search(r'\bpathogenic\b', s_sig_norm))
+                            if has_path and has_likely:
+                                clinvar_evidence.append(("Pathogenic", f"ClinVar_Submission_{s_stars}stars"))
+                                vr.has_strong_pathogenic_evidence = True
+                                vr.is_hq_pathogenic_db = True
+                            elif has_path:
+                                clinvar_evidence.append(("Pathogenic", f"ClinVar_Submission_{s_stars}stars"))
+                                vr.has_strong_pathogenic_evidence = True
+                                vr.is_hq_pathogenic_db = True
+                            elif has_likely:
+                                clinvar_evidence.append(("Likely pathogenic", f"ClinVar_Submission_{s_stars}stars"))
+                            else:
+                                # 3) benign / likely benign
+                                if re.search(r'\blikely\s+benign\b', s_sig_norm):
+                                    clinvar_evidence.append(("Likely benign", f"ClinVar_Submission_{s_stars}stars"))
+                                    vr.has_strong_benign_evidence = True
+                                    vr.is_hq_benign_db = True
+                                elif re.search(r'\bbenign\b', s_sig_norm) and 'pathogen' not in s_sig_norm:
+                                    clinvar_evidence.append(("Benign", f"ClinVar_Submission_{s_stars}stars"))
+                                    vr.has_strong_benign_evidence = True
+                                    vr.is_hq_benign_db = True
+                                else:
+                                    # other/uncertain: keep raw token
+                                    clinvar_evidence.append((s_sig or "Unspecified", f"ClinVar_Submission_{s_stars}stars"))
+
+                    except Exception as e:
+                        logger.debug("Error processing expanded ClinVar submission: %s", e)
+                        continue
+            
+            # Set aggregated ClinVar fields on VariantRecord (only from accepted submissions)
+            if clinvar_sigs_collected:
+                # Deduplicate while preserving order
+                seen = set()
+                unique_sigs = []
+                for sig in clinvar_sigs_collected:
+                    if sig not in seen:
+                        unique_sigs.append(sig)
+                        seen.add(sig)
+                vr.clinvar_sig = ";".join(unique_sigs)
             else:
-                # No expanded submissions found -> DO NOT use VCF aggregate for phenotype/class/star by default.
-                pass
+                vr.clinvar_sig = "Not provided"
+            
+            if clinvar_traits_collected:
+                seen = set()
+                unique_traits = []
+                for trait in clinvar_traits_collected:
+                    if trait not in seen:
+                        unique_traits.append(trait)
+                        seen.add(trait)
+                vr.clinvar_trait = ";".join(unique_traits)
+            else:
+                vr.clinvar_trait = "Not provided"
+            
+            if clinvar_stars_collected:
+                # Sort stars numerically for consistent output
+                vr.clinvar_stars = ";".join(str(s) for s in clinvar_stars_collected)
+            else:
+                vr.clinvar_stars = "0"
 
         except Exception as e:
             logger.debug(f"ClinVar expanded extraction failed: {e}")
+            vr.clinvar_sig = "Not provided"
+            vr.clinvar_trait = "Not provided"
+            vr.clinvar_stars = "0"
+        
         results.extend(clinvar_evidence)
+
         # INTERNAL DB
         internal_evidence = []
         try:
@@ -1886,42 +2559,39 @@ class DatabaseManager:
         except Exception as e:
             logger.debug(f"Internal DB lookup failed: {e}")
         results.extend(internal_evidence)
-        # HGMD
+
+        # HGMD 
         hgmd_evidence = []
         try:
             hgmd_entry = self.hgmd_index.get(vr.chrom, {}).get(vr.pos, {}).get(vr.ref, {}).get(vr.alt)
             if hgmd_entry:
-                tag = hgmd_entry.get('class', '')
-                pubs_str = hgmd_entry.get('pubs', '0')
-                hgmd_gene = hgmd_entry.get('gene', '')
-                rank = hgmd_entry.get('rankscore', '')
-                dmsupported = int(hgmd_entry.get('dmsupported', 0) or 0)                
-                # Store values on variant record
-                vr.hgmd_dmsupported = dmsupported
-                
-                try:
-                    pub_count = int(pubs_str)
-                except (ValueError, TypeError):
-                    pub_count = 0
-                vr.hgmd_publication_count = pub_count
-                vr.hgmd_rankscore = rank if rank and rank != "NULL" else "Not provided"
-                vr.hgmd_phen = hgmd_entry.get('phen', '')
-                vr.hgmd_class = tag
-                
-                # Check pathogenicity support
-                is_well_supported = False
-                if dmsupported >= 2:  # At least 2 points of support
-                    is_well_supported = True
-                
-                # Gene validation
-                gene_valid, gene_reason = validate_gene_match_db_evidence(
-                    vr.gene, hgmd_gene, "HGMD"
-                )
-                
+                tag = str(hgmd_entry.get('class', '')).strip()
+                pubs_str = str(hgmd_entry.get('pubs', '0')).strip()
+                hgmd_gene = str(hgmd_entry.get('gene', '')).strip()
+                rank = str(hgmd_entry.get('rankscore', '')).strip()
+                dmsupported = int(hgmd_entry.get('dmsupported', 0) or 0)
+
+                gene_valid, gene_reason = validate_gene_match_db_evidence(vr.gene, hgmd_gene, "HGMD")
                 if not gene_valid:
-                    vr.manual_reasons.append(gene_reason)
-                    vr.hgmd_class = f"Gene mismatch: {tag}"
+                    # do NOT treat this HGMD entry as evidence for this variant's gene
+                    vr.manual_reasons.append(f"Skipped HGMD entry at {vr.chrom}:{vr.pos} {hgmd_gene}: {gene_reason}")
+                    # keep hgmd meta defaults (do not set hgmd_class/hgmd_phen/pubs as DM)
+                    vr.hgmd_class = ""
+                    vr.hgmd_phen = ""
+                    vr.hgmd_publication_count = 0
+                    vr.hgmd_dmsupported = 0
                 else:
+                    # existing handling for valid gene
+                    try:
+                        pub_count = int(pubs_str)
+                    except (ValueError, TypeError):
+                        pub_count = 0
+                    vr.hgmd_publication_count = pub_count
+                    vr.hgmd_rankscore = rank if rank and rank != "NULL" else "Not provided"
+                    vr.hgmd_phen = str(hgmd_entry.get('phen', '')).strip()
+                    vr.hgmd_class = tag
+                    vr.hgmd_dmsupported = dmsupported
+                    is_well_supported = dmsupported >= 2
                     if tag == 'DM' and is_well_supported:
                         vr.has_strong_pathogenic_evidence = True
                         vr.is_hq_pathogenic_db = True
@@ -1929,20 +2599,139 @@ class DatabaseManager:
                     elif tag == 'DM':
                         vr.has_weak_pathogenic_evidence = True
                         hgmd_evidence.append(("Pathogenic", "HGMD_DM_weak_support"))
-                    else:
+                    elif tag:
                         hgmd_evidence.append((tag, "HGMD"))
+            else:
+                # Initialize HGMD fields to defaults if not found
+                vr.hgmd_dmsupported = 0
+                vr.hgmd_publication_count = 0
+                vr.hgmd_rankscore = "Not provided"
+                vr.hgmd_phen = ""
+                vr.hgmd_class = ""
+                
         except Exception as e:
             logger.debug(f"HGMD dictionary lookup error: {e}")
+            vr.hgmd_dmsupported = 0
+            vr.hgmd_publication_count = 0
+            vr.hgmd_rankscore = "Not provided"
+            vr.hgmd_phen = ""
+            vr.hgmd_class = ""
+        
         results.extend(hgmd_evidence)
-        # Check conflicts
-        hq_sources = [e for e in results if any(q in e[1] for q in ["ClinVar_","Internal_DB","HGMD_DM_"])]
-        if len(hq_sources) >= 2:
-            classifications = set(e[0].lower() for e in hq_sources)
-            has_path = any('pathogen' in c for c in classifications)
-            has_benign = any('benign' in c for c in classifications)
-            if has_path and has_benign:
-                vr.is_hq_conflict_db = True
-                vr.conflict_details = f"Conflict between HQ sources: {', '.join([f'{c[0]} ({c[1]})' for c in hq_sources])}"
+
+        # --- ensure _clin_sigs_all and _clin_stars_all exist in scope (from earlier collection) ---
+        # Fallback: if vr.clinvar_sig already has tokens, add them and try to align stars if vr.clinvar_stars is a ';' list
+        existing_sig = getattr(vr, "clinvar_sig", "") or ""
+        if existing_sig and str(existing_sig).strip() and str(existing_sig).strip().lower() not in ("not provided", ".", "null", "none"):
+            try:
+                parts = [p.strip() for p in re.split(r'[;,\|/]+', str(existing_sig)) if p.strip()]
+                # try to split existing stars string, if it's a semicolon list
+                existing_stars_raw = str(getattr(vr, "clinvar_stars", "") or "")
+                if existing_stars_raw and ";" in existing_stars_raw:
+                    stars_parts = [p.strip() for p in existing_stars_raw.split(";")]
+                else:
+                    stars_parts = []
+                for idx_p, p2 in enumerate(parts):
+                    _clin_sigs_all.append(p2)
+                    if idx_p < len(stars_parts):
+                        _clin_stars_all.append(stars_parts[idx_p])
+                    else:
+                        _clin_stars_all.append("")  # unknown alignment -> empty
+            except Exception:
+                pass
+
+        # Build paired list of (sig, star) to keep alignment robust
+        pairs = []
+        for i, sig in enumerate(_clin_sigs_all):
+            s = (str(sig or "")).strip()
+            # guard against missing star entries
+            star = _clin_stars_all[i] if i < len(_clin_stars_all) else ""
+            star = "" if star in (None, "None") else str(star).strip()
+            if not s:
+                continue
+            pairs.append((s, star))
+
+        # Deduplicate preserving order (case-insensitive)
+        uniq_pairs = []
+        seen = set()
+        for sig, star in pairs:
+            key = sig.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq_pairs.append((sig, star))
+
+        # If we have no signatures at all, fallback to existing_sig / default
+        if not uniq_pairs:
+            if existing_sig and existing_sig.strip() and existing_sig.strip().lower() not in ("not provided", ".", "null", "none"):
+                vr.clinvar_sig = existing_sig
+            else:
+                vr.clinvar_sig = "Not provided"
+            if not getattr(vr, "clinvar_stars", ""):
+                vr.clinvar_stars = "0"
+        else:
+            # decide whether definitive labels exist
+            def _is_definitive_label(s):
+                return bool(re.search(r'\b(likely\s+pathogenic|pathogenic|likely\s+benign|benign)\b', (s or "").lower()))
+            has_definitive = any(_is_definitive_label(sig) for sig, _ in uniq_pairs)
+
+            # Filter out conflict tokens only if definitive labels exist; keep star alignment
+            final_pairs = []
+            for sig, star in uniq_pairs:
+                sig_l = sig.lower()
+                if has_definitive and re.search(r'\b(conflict|conflicting)\b', sig_l):
+                    # skip conflict token when other definitive tokens present
+                    continue
+                final_pairs.append((sig, star))
+
+            # If filtering removed everything (only conflicts present), keep original uniq_pairs (so conflict preserved)
+            if not final_pairs:
+                final_pairs = uniq_pairs
+
+            final_sigs = [p for p, _ in final_pairs]
+            final_stars = [st for _, st in final_pairs if st not in ("", None)]
+
+            vr.clinvar_sig = ";".join(final_sigs) if final_sigs else "Not provided"
+            if final_stars:
+                vr.clinvar_stars = ";".join(final_stars)
+            else:
+                vr.clinvar_stars = getattr(vr, "clinvar_stars", "") or "0"
+
+        # CONFLICT DETECTION
+        try:
+            hq_sources = []
+            for classification, source in results:
+                is_hq = False
+                if source.startswith("ClinVar_Submission_"):
+                    try:
+                        stars_match = re.search(r'(\d+)stars', source)
+                        if stars_match:
+                            stars = int(stars_match.group(1))
+                            if stars >= 2:
+                                is_hq = True
+                    except Exception:
+                        pass
+                elif source.startswith("HGMD_DM_"):
+                    is_hq = True
+                elif source == "Internal_DB" and classification in ("Pathogenic", "Likely pathogenic"):
+                    is_hq = True
+                if is_hq:
+                    hq_sources.append((classification, source))
+            if len(hq_sources) >= 2:
+                classifications = set(c[0].lower() for c in hq_sources)
+                has_path = any('pathogen' in c for c in classifications)
+                has_benign = any('benign' in c for c in classifications)
+                if has_path and has_benign:
+                    vr.is_hq_conflict_db = True
+                    vr.conflict_details = f"Conflict between HQ sources: {', '.join([f'{c[0]} ({c[1]})' for c in hq_sources])}"
+        except Exception as e:
+            logger.debug(f"Conflict detection failed: {e}")
+        
+        vr.db_hits = results
+        try:
+            aggregate_clinvar_signatures(vr)
+        except Exception:
+            pass
         vr.db_hits = results
         return results
 
@@ -2036,12 +2825,14 @@ class DatabaseManager:
             logger.warning("ClinVar load error: %s", e)
 
     def find_protein_variant_by_hgvsp(self, gene: str, hgvsp: str, pos_aa: int, transcript: str,
-                                    current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
-                                    current_ref: Optional[str] = None, current_alt: Optional[str] = None,
-                                    acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
+                                     current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
+                                     current_ref: Optional[str] = None, current_alt: Optional[str] = None,
+                                     acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
         """
         Phenotype-aware PS1/PM5 lookup using ONLY clinvar_expanded submissions when available.
         If no expanded submissions are available for the variant, this function returns [] (no fallback).
+        Improved: require gene validation for ClinVar submissions (skip submissions that clearly refer to another gene),
+        but allow submission when HGVSp exactly matches current HGVSp (ties it to the protein).
         """
         if not hgvsp or not gene:
             return []
@@ -2062,27 +2853,47 @@ class DatabaseManager:
         for s in expanded:
             try:
                 phen = s.get("phenotype","") or ""
-                if acmg_disease:
+                s_hgvsp = clean_hgvsp(s.get("hgvsp","") or "")
+                s_sig = s.get("clnsig","") or ""
+                sid = s.get("submission_id","") or ""
+                s_gene = s.get("gene","") or s.get("gene_raw","") or ""
+
+                # Gene validation: skip submissions that clearly refer to a different gene,
+                # unless HGVS protein exactly matches.
+                gene_valid, gene_reason = validate_gene_match_db_evidence(gene, s_gene, "ClinVar")
+                if not gene_valid and s_hgvsp != current_hgvsp_clean:
+                    # skip this submission for PS1/PM5 lookup since it appears to be about another gene
+                    continue
+
+                # phenotype restriction (if ACMG disease specified)
+                if acmg_disease and phen:
                     matched, _, _ = check_disease_match(acmg_disease, phen)
                     if not matched:
                         continue
-                s_hgvsp = clean_hgvsp(s.get("hgvsp","") or "")
-                # if expanded record has HGVSp and it doesn't match current -> skip (PS1 requires same AA change)
-                if s_hgvsp and current_hgvsp_clean and s_hgvsp != current_hgvsp_clean:
-                    continue
-                s_sig = s.get("clinsig","") or ""
-                sid = s.get("submission_id","") or ""
-                key = f"sub:{sid}|{s_sig}|{phen}|{s_hgvsp}"
+
+                key = f"sub:{sid}|{s_sig}|{phen}|{s_hgvsp}|{s_gene}"
                 if key in seen:
                     continue
                 seen.add(key)
-                s_sig_low = s_sig.lower()
-                if "pathogenic" in s_sig_low and "likely" not in s_sig_low:
-                    results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
-                elif "likely pathogenic" in s_sig_low or ("likely" in s_sig_low and "pathogen" in s_sig_low):
-                    results.append((s_sig, "ClinVar_Submission_Likely_pathogenic", s))
+
+                s_sig = str(s.get("clnsig", "") or "").strip()
+                s_sig_norm = re.sub(r'[_\s]+', ' ', s_sig.lower().strip())
+
+                # conflict detection
+                if re.search(r'\bconflict', s_sig_norm):
+                    results.append((s_sig, "ClinVar_Submission_Conflicting", s))
                 else:
-                    results.append((s_sig, "ClinVar_Submission", s))
+                    has_likely = bool(re.search(r'\blikely\s+pathogenic\b', s_sig_norm))
+                    has_path = bool(re.search(r'\bpathogenic\b', s_sig_norm))
+                    if has_path and has_likely:
+                        # single submission includes both -> treat as Pathogenic
+                        results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
+                    elif has_path:
+                        results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
+                    elif has_likely:
+                        results.append((s_sig, "ClinVar_Submission_Likely_pathogenic", s))
+                    else:
+                        results.append((s_sig, "ClinVar_Submission", s))
             except Exception:
                 continue
 
@@ -2120,23 +2931,33 @@ class DatabaseManager:
                 continue
 
             # check significance & stars
-            clnsig = str(entry.get('clnsig', '')).lower()
+            clnsig_raw = str(entry.get('clnsig', '') or "").strip()
             stars = int(entry.get('stars', 0) or 0)
-
-            # require at least 1 star
             if stars < 2:
                 continue
 
-            # skip benign entries
-            if "benign" in clnsig and "pathogen" not in clnsig:
+            clnsig_norm = re.sub(r'[_\s]+', ' ', clnsig_raw.lower().strip())
+
+            # skip explicit benign entries
+            if re.search(r'\bbenign\b', clnsig_norm) and 'pathogen' not in clnsig_norm:
                 continue
 
-            # Determine the best classification
-            best_class = "Unknown"
-            if "pathogenic" in clnsig and "likely" not in clnsig:
+            # determine best_class with conflict-handling and combined token rule
+            if re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', clnsig_norm):
+                # skip conflicting as pathogenic evidence for PM5
+                continue
+
+            has_likely = bool(re.search(r'\blikely\s+pathogenic\b', clnsig_norm))
+            has_path = bool(re.search(r'\bpathogenic\b', clnsig_norm))
+
+            if has_path and has_likely:
                 best_class = "Pathogenic"
-            elif "likely pathogenic" in clnsig or ("likely" in clnsig and "pathogen" in clnsig):
+            elif has_path:
+                best_class = "Pathogenic"
+            elif has_likely:
                 best_class = "Likely pathogenic"
+            else:
+                best_class = "Unknown"
             
             # Add detailed entry to results
             results.append({
@@ -2232,7 +3053,7 @@ def load_exons_table(path: str) -> Optional[pd.DataFrame]:
                         'exon_number': int(last_exon['Exon_Number']),
                         'gene': last_exon.get('Gene', '')
                     }
-        df_clean._transcript_last_exons = transcript_last_exons
+        df_clean = df_clean.assign(_transcript_last_exons=transcript_last_exons)
         logger.info(f"Loaded exon data for {len(transcript_last_exons)} transcripts")
         return df_clean
     except Exception as e:
@@ -3527,7 +4348,10 @@ class ACMGEngine:
                     continue
 
                 cln_low = clnsig.lower()
-                if "pathogenic" in cln_low and "likely" not in cln_low:
+                if "conflict" in cln_low:
+                    vr.ps1_matches.append({"hgvsp": info.get("hgvsp", vr.hgvsp), "clnsig": clnsig, "source": src, "stars": info.get("stars", "")})
+                    break
+                elif "pathogenic" in cln_low and "likely" not in cln_low:
                     # Strong PS1
                     assigned.append("PS1_Strong")
                     pts["PS1_Strong"] = POINTS_MAP.get("PS1_Strong", 4)
@@ -3681,6 +4505,7 @@ class ACMGEngine:
         # --- ClinVar block ---
         clin_block_raw = 0.0
         clin_match_flag = False
+
         CLIN_BASE_MAP = {
             "pathogenic": 3,
             "likely pathogenic": 2,
@@ -3693,96 +4518,141 @@ class ACMGEngine:
         CLIN_STAR_COEF = {5: 2.0, 4: 1.5, 3: 1.25, 2: 1.0, 1: 0.75, 0: 0.5}
 
         try:
-            # Get aggregated ClinVar data directly from variant record
-            agg_sig = str(vr.clinvar_sig or "").strip()
+            # filter out skipped:
+            skipped_ids = {s.get("submission_id") for s in getattr(vr, "_clinvar_submissions_skipped", []) or []}
+            clin_subs = [s for s in getattr(vr, "clinvar_submissions", []) or [] if s.get("submission_id") not in skipped_ids]
             
-            # Only proceed if we have actual ClinVar data
-            if agg_sig and agg_sig.lower() not in ("not provided", "", ".", "null", "none"):
-                # Parse stars
-                agg_stars = 0
-                try:
-                    agg_stars = int(float(str(vr.clinvar_stars or "0")))
-                except (ValueError, TypeError):
-                    agg_stars = 0
+            if clin_subs:
+                best_base = 0
+                best_stars = 0
+                matched_any = False
                 
-                # Split on common separators to handle combined terms
-                parts = re.split(r'[;,\|/]+', agg_sig.lower())
-                parts = [p.strip().replace("_", " ") for p in parts if p.strip()]
-                
-                # Determine the strongest classification
-                base = 0
-                has_pathogenic = False
-                has_likely_pathogenic = False
-                
-                for p in parts:
-                    p_clean = p.strip()
-                    if p_clean == "likely pathogenic" or "likely pathogenic" in p_clean:
-                        has_likely_pathogenic = True
-                    elif "pathogenic" in p_clean and "likely" not in p_clean:
-                        has_pathogenic = True
-                
-                if has_pathogenic:
-                    base = CLIN_BASE_MAP.get("pathogenic", 3)
-                elif has_pathogenic and has_likely_pathogenic:
-                    base = CLIN_BASE_MAP.get("pathogenic", 3)  
-                elif has_likely_pathogenic:
-                    base = CLIN_BASE_MAP.get("likely pathogenic", 2)
-                elif "conflict" in " ".join(parts):
-                    base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1)
-                elif any("benign" in p for p in parts):
-                    has_benign = any(p == "benign" or (p == "benign" and "likely" not in p) for p in parts)
-                    has_likely_benign = any("likely benign" in p for p in parts)
-                    
-                    if has_benign:
-                        base = CLIN_BASE_MAP.get("benign", -3)
-                    elif has_likely_benign:
-                        base = CLIN_BASE_MAP.get("likely benign", -2)
-                elif any("uncertain" in p or "vus" in p for p in parts):
-                    base = CLIN_BASE_MAP.get("uncertain significance", -1)
-                
-                # Apply star coefficient
-                coef = CLIN_STAR_COEF.get(agg_stars, 0.5)
-                clin_block_raw = float(base) * float(coef)
-                
-                # Check phenotype match
-                clinvar_trait_text = str(vr.clinvar_trait or "")
-                clin_match_flag = False
-                clin_match_level = ""
-                clin_match_reason = ""
-                if acmg_disease and clinvar_trait_text:
-                    try:
-                        matched, match_level, match_reason = check_disease_match(acmg_disease, clinvar_trait_text)
-                        clin_match_flag = bool(matched)
-                        clin_match_level = match_level or ""
-                        clin_match_reason = match_reason or ""
-                    except Exception:
-                        clin_match_flag = False
-                        clin_match_level = ""
-                        clin_match_reason = ""
-                else:
-                    # no ClinVar trait or no acmg disease -> explicit negative/unknown match
-                    clin_match_flag = False
-                    clin_match_level = "no_db_phenotype" if not clinvar_trait_text else ""
-                    clin_match_reason = "No ClinVar trait text" if not clinvar_trait_text else ""
+                for sub in clin_subs:
+                    sig_raw = str(sub.get("clnsig", "") or "").strip()
+                    phen = str(sub.get("phenotype", "")).strip()
+                    stars = int(sub.get("stars", 0) or 0)
+                    sig_norm = re.sub(r'[_\s]+', ' ', sig_raw.lower().strip())
 
-                # persist ClinVar phenotype-match meta on the variant record for downstream audit
-                try:
-                    vr._clinvar_phenotype_match = bool(clin_match_flag)
-                    vr._clinvar_phenotype_match_level = str(clin_match_level)
-                    vr._clinvar_phenotype_match_reason = str(clin_match_reason)
-                except Exception:
-                    pass
+                    sub_base = 0
+
+                    # Conflict detection first
+                    if re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', sig_norm):
+                        sub_base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1))
+                    else:
+                        has_likely = bool(re.search(r'\blikely\s+pathogenic\b', sig_norm))
+                        has_path = bool(re.search(r'\bpathogenic\b', sig_norm))
+                        if has_path and has_likely:
+                            # single submission contains both -> treat as Pathogenic (user requirement)
+                            sub_base = CLIN_BASE_MAP.get("pathogenic", 3)
+                        elif has_path:
+                            sub_base = CLIN_BASE_MAP.get("pathogenic", 3)
+                        elif has_likely:
+                            sub_base = CLIN_BASE_MAP.get("likely pathogenic", 2)
+                        elif re.search(r'\blikely\s+benign\b', sig_norm):
+                            sub_base = CLIN_BASE_MAP.get("likely benign", -2)
+                        elif re.search(r'\bbenign\b', sig_norm) and 'pathogen' not in sig_norm:
+                            sub_base = CLIN_BASE_MAP.get("benign", -3)
+                        elif 'uncertain' in sig_norm or 'vus' in sig_norm:
+                            sub_base = CLIN_BASE_MAP.get("uncertain significance", CLIN_BASE_MAP.get("uncertain significance", -1))
+                        else:
+                            # fallback: leave sub_base 0 (unknown/uninterpretable)
+                            sub_base = 0
+                    
+                    if abs(sub_base) > abs(best_base):
+                        best_base = sub_base
+                        best_stars = stars
+                    
+                    if acmg_disease and phen and not matched_any:
+                        try:
+                            matched, match_level, match_reason = check_disease_match(acmg_disease, phen)
+                            if matched:
+                                clin_match_flag = True
+                                matched_any = True
+                                vr._clinvar_phenotype_match = True
+                                vr._clinvar_phenotype_match_level = match_level or ""
+                                vr._clinvar_phenotype_match_reason = match_reason or ""
+                        except Exception:
+                            pass
                 
-                # Cap if no phenotype match (but only if we have non-zero block)
+                coef = CLIN_STAR_COEF.get(best_stars, 0.5)
+                clin_block_raw = float(best_base) * float(coef)
+                
                 if not clin_match_flag and clin_block_raw != 0:
                     if clin_block_raw > 1.0:
                         clin_block_raw = 1.0
                     elif clin_block_raw < -1.0:
                         clin_block_raw = -1.0
-            else:
-                clin_block_raw = 0.0
-                clin_match_flag = False
                 
+                if not clin_match_flag:
+                    vr._clinvar_phenotype_match = False
+                    vr._clinvar_phenotype_match_level = "no_phenotype_match"
+                    vr._clinvar_phenotype_match_reason = "No phenotype matched ACMG disease"
+            else:
+                agg_sig = str(vr.clinvar_sig or "").strip()
+                
+                if agg_sig and agg_sig.lower() not in ("not provided", "", ".", "null", "none"):
+                    agg_stars = 0
+                    try:
+                        agg_stars = int(float(str(vr.clinvar_stars or "0")))
+                    except (ValueError, TypeError):
+                        agg_stars = 0
+                    
+                    parts = re.split(r'[;,\|/]+', agg_sig.lower())
+                    parts = [p.strip().replace("_", " ") for p in parts if p.strip()]
+                    
+                    base = 0
+                    has_pathogenic = False
+                    has_likely_pathogenic = False
+                    
+                    for p in parts:
+                        p_clean = p.strip()
+                        if p_clean == "likely pathogenic" or "likely pathogenic" in p_clean:
+                            has_likely_pathogenic = True
+                        elif "pathogenic" in p_clean and "likely" not in p_clean:
+                            has_pathogenic = True
+                    
+                    if has_pathogenic:
+                        base = CLIN_BASE_MAP.get("pathogenic", 3)
+                    elif has_likely_pathogenic:
+                        base = CLIN_BASE_MAP.get("likely pathogenic", 2)
+                    elif "conflict" in " ".join(parts):
+                        base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1)
+                    elif any("benign" in p for p in parts):
+                        has_benign = any(p == "benign" or (p == "benign" and "likely" not in p) for p in parts)
+                        has_likely_benign = any("likely benign" in p for p in parts)
+                        
+                        if has_benign:
+                            base = CLIN_BASE_MAP.get("benign", -3)
+                        elif has_likely_benign:
+                            base = CLIN_BASE_MAP.get("likely benign", -2)
+                    elif any("uncertain" in p or "vus" in p for p in parts):
+                        base = CLIN_BASE_MAP.get("uncertain significance", -1)
+                    
+                    coef = CLIN_STAR_COEF.get(agg_stars, 0.5)
+                    clin_block_raw = float(base) * float(coef)
+                    
+                    # Check phenotype match 
+                    clinvar_trait_text = str(vr.clinvar_trait or "")
+                    clin_match_flag = False
+                    if acmg_disease and clinvar_trait_text:
+                        try:
+                            matched, match_level, match_reason = check_disease_match(acmg_disease, clinvar_trait_text)
+                            clin_match_flag = bool(matched)
+                            vr._clinvar_phenotype_match = clin_match_flag
+                            vr._clinvar_phenotype_match_level = match_level or ""
+                            vr._clinvar_phenotype_match_reason = match_reason or ""
+                        except Exception:
+                            clin_match_flag = False
+                    
+                    if not clin_match_flag and clin_block_raw != 0:
+                        if clin_block_raw > 1.0:
+                            clin_block_raw = 1.0
+                        elif clin_block_raw < -1.0:
+                            clin_block_raw = -1.0
+                else:
+                    clin_block_raw = 0.0
+                    clin_match_flag = False
+
         except Exception as e:
             logger.debug(f"ClinVar block calculation failed: {e}")
             clin_block_raw = 0.0
@@ -4036,6 +4906,33 @@ class ACMGEngine:
             assigned, pts_ext, vr.total_points, vr.automated_class, (";".join(getattr(vr, "manual_reasons", [])) if getattr(vr, "manual_reasons", None) else "")
         )
 
+        # =========================================================================
+        # CRITICAL GUARD: Enforce minimum criteria count for Pathogenic classification
+        # - Pathogenic requires >2 pathogenic criteria (>2, не >=2)
+        # - If exactly 2 criteria present -> downgrade to Likely pathogenic
+        # =========================================================================
+        try:
+            path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS", "PS", "PM", "PP"]))
+            
+            if vr.automated_class == "Pathogenic":
+                if path_cnt <= 2:
+                    vr.automated_class = "Likely pathogenic"
+                    vr.extended_class = "Likely pathogenic"
+                    note = f"Downgraded Pathogenic -> Likely pathogenic: only {path_cnt} pathogenic criteria present (requires >2)"
+                    if note not in vr.manual_reasons:
+                        vr.manual_reasons.append(note)
+            
+            elif vr.automated_class == "Likely pathogenic":
+                if path_cnt < 1:
+                    vr.automated_class = "VUS"
+                    vr.extended_class = "VUS"
+                    note = "Downgraded Likely pathogenic -> VUS: no strong pathogenic criteria"
+                    if note not in vr.manual_reasons:
+                        vr.manual_reasons.append(note)
+                        
+        except Exception as e:
+            logger.debug(f"Failed to apply criteria count guard: {e}")
+
         # Final return now reflects extended points/class as authoritative
         return assigned, pts_ext, vr.automated_class, False, getattr(vr, "manual_reasons", [])
 
@@ -4276,23 +5173,34 @@ class ACMGEngine:
 def deduplicate_candidates(candidates: List[VariantRecord]) -> List[VariantRecord]:
     keymap: Dict[Tuple[str,str,int,str,str,str], VariantRecord] = {}
     for v in candidates:
-        key = (v.sample or "",
-            v.chrom or "",
-            int(v.pos),
-            v.ref or "",
-            v.alt or "",
-            (v.gene or "").upper())
+        # CRITICAL: Include sample in the key to keep variants from different individuals separate
+        key = (
+            v.sample or "unknown",           # Sample name is crucial
+            v.chrom or "",                    # Chromosome
+            int(v.pos),                        # Position
+            v.ref or "",                       # Reference allele
+            v.alt or "",                        # Alternative allele
+            (v.gene or "").upper()              # Gene (normalized)
+        )
+        
         if key not in keymap:
             keymap[key] = v
             continue
+            
+        # If duplicate exists, keep the one with better annotations
         existing = keymap[key]
+        
+        # Prefer MANE transcript
         e_ann = getattr(existing, "_raw_ann", {}) or {}
         v_ann = getattr(v, "_raw_ann", {}) or {}
         e_can = str(e_ann.get("MANE_PLUS_CLINICAL") or e_ann.get("MANE_SELECT") or e_ann.get("CANONICAL") or "").upper()
         v_can = str(v_ann.get("MANE_PLUS_CLINICAL") or v_ann.get("MANE_SELECT") or v_ann.get("CANONICAL") or "").upper()
+        
         if v_can in ("YES","Y","TRUE","1") and not (e_can in ("YES","Y","TRUE","1")):
             keymap[key] = v
             continue
+            
+        # Prefer higher total points
         try:
             ev_pts = int(getattr(existing, "total_points", 0) or 0)
         except Exception:
@@ -4301,22 +5209,11 @@ def deduplicate_candidates(candidates: List[VariantRecord]) -> List[VariantRecor
             v_pts = int(getattr(v, "total_points", 0) or 0)
         except Exception:
             v_pts = 0
+            
         if v_pts > ev_pts:
             keymap[key] = v
             continue
-        def safe_float(val):
-            if val is None: return 0.0
-            try: return float(val)
-            except (ValueError, TypeError): return 0.0
-        def score(rec: VariantRecord) -> float:
-            r = safe_float(getattr(rec, "revel", None))
-            c = safe_float(getattr(rec, "cadd", None))
-            return r + (c / 25.0)
-        v_score = score(v)
-        e_score = score(existing)
-        if v_score > e_score:
-            keymap[key] = v
-            continue
+            
     return list(keymap.values())
 
 # ---------------------------
@@ -5017,39 +5914,74 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
     unique_rules = list(dict.fromkeys(raw_rules))
     rules_applied_str = ";".join(unique_rules)
 
-    # === ClinVar outputs: use clinvar_submissions (ordered) if present ===
-    clin_subs = getattr(v, "clinvar_submissions", []) or []
+    # === ClinVar outputs: HIERARCHICAL LOGIC ===
+    # Use individual ClinVar submissions from CSV when available.
+    # Priority: submissions with disease phenotype match > all submissions
+    raw_clin_subs = getattr(v, "clinvar_submissions", []) or []
+    # Filter out any submissions that were explicitly skipped due to gene mismatch
+    clin_subs = [s for s in raw_clin_subs if not (isinstance(s, dict) and str(s.get("note", "")).lower().startswith("gene_mismatch"))]
+
+    # First pass: identify submissions where phenotype matches ACMG disease
+    matching_subs = []
+    if clin_subs:
+        for sub in clin_subs:
+            phen = str(sub.get("phenotype", "")).strip()
+            if acmg_disease and phen:
+                try:
+                    matched, _, _ = check_disease_match(acmg_disease, phen)
+                    if matched:
+                        matching_subs.append(sub)
+                except Exception:
+                    pass
+
+    # Select which submissions to report:
+    # - If phenotype matches found: report ONLY matching submissions
+    # - Otherwise: report all submissions from CSV
+    if matching_subs:
+        # Phenotype match found: use only matching submissions for output
+        subs_to_output = matching_subs
+        phenotype_match_flag = True
+        logger.debug(f"ClinVar output: using {len(matching_subs)} phenotype-matched submissions (of {len(clin_subs)} total)")
+    else:
+        # No phenotype match: report all submissions to provide complete ClinVar evidence
+        subs_to_output = clin_subs
+        phenotype_match_flag = False
+        logger.debug(f"ClinVar output: no phenotype match, using all {len(clin_subs)} submissions")
+
+    # Build output fields from selected submissions, preserving order and multiplicity
+    # Each submission contributes one entry to each field (no deduplication)
     clin_sigs = []
     clin_phens = []
     clin_stars_seq = []
+
     for s in clin_subs:
-        sig = str(s.get("clinsig","")).strip()
+        sig = str(s.get("clnsig","")).strip()
         phen = str(s.get("phenotype","")).strip()
         star = str(int(s.get("stars", 0) or 0))
+        
         if sig and sig.lower() not in ("not provided", ".", "null"):
             clin_sigs.append(sig)
-        if phen and phen.lower() not in ("not provided", ".", "null"):
-            clin_phens.append(phen)
+        else:
+            clin_sigs.append("Not provided")
+        
+        if phen and phen.lower() not in (".", "null"):
+            phen_clean = re.sub(r'^(C\d{7}|MIM:\d+):', '', phen).strip()
+            clin_phens.append(phen_clean)
+        else:
+            clin_phens.append("Not provided")
+        
         clin_stars_seq.append(star)
 
-    # dedupe preserving order
-    def _uniq_preserve(seq):
-        seen = set()
-        out = []
-        for x in seq:
-            if x in seen or x == "":
-                continue
-            seen.add(x)
-            out.append(x)
-        return out
+    # Join fields with semicolon separator to create output strings
+    # Submissions are listed in order with parallel fields (sig;sig;sig vs trait;trait;trait vs stars;stars;stars)
+    clinvar_sig_field = ";".join(clin_sigs) if clin_sigs else (v.clinvar_sig or "Not provided")
+    clinvar_trait_field = ";".join(clin_phens) if clin_phens else (v.clinvar_trait or "Not provided")
+    clinvar_stars_field = ";".join(clin_stars_seq) if clin_stars_seq else (str(v.clinvar_stars) if v.clinvar_stars else "0")
 
-    clin_sigs_u = _uniq_preserve(clin_sigs)
-    clin_phens_u = _uniq_preserve(clin_phens)
-    clin_stars_u = clin_stars_seq  # keep sequence corresponding to submissions; optionally dedupe if desired
-
-    clinvar_sig_field = ";".join(clin_sigs_u) if clin_sigs_u else (v.clinvar_sig or "Not provided")
-    clinvar_trait_field = ";".join(clin_phens_u) if clin_phens_u else (v.clinvar_trait or "Not provided")
-    clinvar_stars_field = ";".join(clin_stars_u) if clin_stars_u else (str(v.clinvar_stars) if v.clinvar_stars else "0")
+    # Set phenotype match flags for downstream processing
+    # Combines the result from CSV submissions with any VCF-level phenotype match
+    clin_match_flag = phenotype_match_flag or getattr(v, "_clinvar_phenotype_match", False)
+    clin_match_reason = getattr(v, "_clinvar_phenotype_match_reason", "")
 
     # HGMD phenotype field (dedupe)
     hgmd_ph = getattr(v, "hgmd_phen", "") or ""
@@ -5120,6 +6052,7 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "AA_ref": v.aa_ref or "",
         "AA_alt": v.aa_alt or "",
         "AA_pos": v.aa_pos or "",
+        "tid": v.tid,
         "Exon": v.exon,
         "Consequence": v.consequence,
         "Impact": v._raw_ann.get("IMPACT", "") if getattr(v, "_raw_ann", None) else getattr(v, "impact", ""),
@@ -6951,7 +7884,7 @@ def strict_triage_and_output(
     # Define columns including per-criterion explanation columns
     COLUMNS = [
         "sample","Family_ID","chrom","pos","ref","alt","gene","Inheritance",
-        "HGVSc","HGVSp","AA_ref","AA_alt","AA_pos","Exon","Consequence","Impact","Zygosity","DP","Sample_AF",
+        "HGVSc","HGVSp","AA_ref","AA_alt","AA_pos","tid","Exon","Consequence","Impact","Zygosity","DP","Sample_AF",
         "acmg_disease_association","Special_Guidance", "Rules_applied",
         "clinvar_phenotype_match","clinvar_phenotype_info",
         "hgmd_phenotype_match","hgmd_phenotype_info",
@@ -7295,6 +8228,14 @@ def strict_triage_and_output(
     manual_rows_c = collapse_output_rows(rows_manual)
     all_rows_c = collapse_output_rows(rows_all)
 
+    # Ensure we have rows for ALL samples, even if they have no reportable variants
+    all_samples_in_data = set(v.sample for v in all_variants)
+    samples_in_output = set(row.get("sample") for row in all_rows_c)
+
+    missing_samples = all_samples_in_data - samples_in_output
+    if missing_samples:
+        logger.warning(f"Samples with no output rows: {missing_samples}")
+
     # write CSVs (pandas preferred)
     path_all = os.path.join(outdir, "all_candidates.csv")
     path_auto = os.path.join(outdir, "auto_conclusions.csv")
@@ -7507,11 +8448,41 @@ def build_variant_record_from_rec(rec, acmg_genes_normalized: set,
     gene_raw = _to_str(info_get("GENE", "SYMBOL", "GENEINFO", "Gene", default="")) or ""
     hgvsc = _to_str(info_get("HGVSC", "HGV_SC", "HGV_S", "HGVSc", default="")) or ""
     hgvsp = _to_str(info_get("HGVSP", "HGV_SP", "HGV_P", "HGVSp", default="")) or ""
-    transcript = _to_str(info_get("TRANSCRIPT", "FEATURE", "FEATURE_ID", "TRANSCRIPT_SELECT", "MANE_SELECT", "CANONICAL", default="")) or ""
+    transcript = _to_str(info_get("TRANSCRIPT", "TRANSCRIPT_SELECT", "MANE_SELECT", "CANONICAL", default="")) or ""
+    
+    tid = _to_str(info_get("tid", "TID", "TRANSCRIPT_ID", "transcript_id", "FEATURE", "feature", default="")) or ""
+    
+    if not tid and hgvsc:
+        if ":" in hgvsc:
+            tx_part = hgvsc.split(":", 1)[0]
+            if tx_part.startswith(("ENST", "NM_", "XM_", "XR_", "NR_")):
+                tid = tx_part
     consequence = _to_str(info_get("CONSEQUENCE", "CONSEQUENCE_VEP", "CONS", "Annotation", "Consequence", default="")) or ""
 
     revel = _to_float(info_get("REVEL_SCORE", "REVEL", default=None))
-    alpha_missense = _to_float(info_get("ALPHA_MISSENSE", "ALPHA_MISSENSE_SCORE", "ALPHAMISSENSE", "AlphaMissense", default=None))
+    alpha_missense = None
+    alpha_val = info_get("AlphaMissense", default=None)
+    if alpha_val is not None and str(alpha_val).strip() and str(alpha_val).strip().lower() not in ["", ".", "na", "none", "null"]:
+        try:
+            alpha_missense = _to_float(alpha_val)
+            logger.debug(f"Found AlphaMissense={alpha_missense} from key=AlphaMissense")
+        except Exception:
+            pass
+    else:
+        # Если не нашли, пробуем другие варианты
+        alpha_keys = ["ALPHAMISSENSE", "ALPHA_MISSENSE", "alpha_missense", 
+                      "ALPHA-MISSENSE", "AlphaMissense_score", "ALPHAMISSENSE_SCORE"]
+        for key in alpha_keys:
+            val = info_get(key, default=None)
+            if val is not None and str(val).strip() and str(val).strip().lower() not in ["", ".", "na", "none", "null"]:
+                try:
+                    alpha_missense = _to_float(val)
+                    if alpha_missense is not None:
+                        logger.debug(f"Found AlphaMissense={alpha_missense} from key={key}")
+                        break
+                except Exception:
+                    continue
+    
     spliceai = _to_float(info_get("SPLICE_AI_SCORE", "SPLICEAI", "splice_ai_score", "SpliceAI", default=None))
     cadd = _to_float(info_get("CADD_PHRED", "CADD", "CADD_phred", "Dscore", "DSCORE", default=None))
 
@@ -7716,7 +8687,8 @@ def build_variant_record_from_rec(rec, acmg_genes_normalized: set,
         sample=sample_name,
         gene=normalize_gene_name(gene_raw) if gene_raw else "",
         gene_raw=gene_raw,
-        transcript=transcript,
+        transcript=transcript, 
+        tid=tid,  
         consequence=consequence,
         hgvsc=hgvsc,
         hgvsp=hgvsp,
@@ -7800,6 +8772,27 @@ def build_variant_record_from_rec(rec, acmg_genes_normalized: set,
     raw_keys = ("GENE", "HGVSC", "HGVSP", "REVEL_SCORE", "REVEL", "ALPHA_MISSENSE",
                 "ALPHAMISSENSE", "SPLICE_AI_SCORE", "SPLICEAI", "CADD_PHRED", "Dscore", "DSCORE", "NMD", "GNOMAD_AF", "MAX_AF")
     vr._raw_ann = {k: info_up.get(k) for k in raw_keys if k in info_up}
+
+    try:
+        if getattr(vr, "_raw_ann", None):
+            for k in ("ALPHAMISSENSE", "ALPHA_MISSENSE", "AlphaMissense", "alpha_missense", "ALPHA-MISSENSE"):
+                val = vr._raw_ann.get(k) if isinstance(vr._raw_ann, dict) else None
+                if val in (None, "", "."):
+                    continue
+                try:
+                    vr.alpha_missense = float(val)
+                    break
+                except Exception:
+                    # sometimes value like "NA" or "Not_provided" — skip
+                    try:
+                        s = str(val).strip()
+                        if s and s.lower() not in ("na", "not provided", "not_provided", ".", "null"):
+                            vr.alpha_missense = float(s)
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        vr.alpha_missense = getattr(vr, "alpha_missense", None)
 
     # Normalize Impact into vr._raw_ann and vr.impact convenience attribute
     try:
@@ -8097,226 +9090,148 @@ def process_vcf(proband_vcf: str,
             logger.warning("Failed to load NMD table %s: %s", nmd_table, e)
             nmd_map = {}
 
-    # --- VCF parsing: fast path for generate.py SQLiteExport-style files ---
+    # ---------------------------
+    # VCF parsing: MONO-MODE (each sample independent)
+    # ---------------------------
     candidates: List[VariantRecord] = []
-    logger.info("Parsing VCF (INFO/FORMAT-first parsing)...")
+    logger.info("Parsing VCFs in mono-mode (each sample independent)...")
 
-    # Robust detection of "SQLiteExport-style" simple VCF even when gzipped without .gz extension.
-    use_simple_extract = False
-    sample_name_from_header = None
-    try:
-        # choose opener based on filename extension OR magic bytes
-        opener = gzip.open if (str(annotated_vcf).endswith((".gz", ".bgz")) or is_gzipped(annotated_vcf)) else open
-        with opener(annotated_vcf, "rt", encoding="utf-8", errors="ignore") as fh:
-            header_sample_line = None
-            first_data_line = None
-            for ln in fh:
-                if ln.startswith("#CHROM"):
-                    # keep the header line containing sample names
-                    header_sample_line = ln.rstrip("\n")
-                    continue
-                if not ln.startswith("#"):
-                    # first non-header data line for FORMAT inspection
-                    first_data_line = ln.rstrip("\n")
-                    break
-        # extract sample name from header if present
-        if header_sample_line:
-            parts = re.split(r'\t+', header_sample_line)
-            if len(parts) >= 10:
-                sample_name_from_header = parts[9]
-        # inspect FORMAT field of first data line and require GT,DP,AD,AF
-        if first_data_line:
-            parts = re.split(r'\t+', first_data_line)
-            if len(parts) >= 9:
-                fmt = parts[8]
-                if all(tok in fmt for tok in ("GT", "DP", "AD", "AF")):
-                    use_simple_extract = True
-        logger.info("use_simple_extract=%s sample_from_header=%s annotated_vcf=%s (gz=%s)",
-            use_simple_extract, sample_name_from_header, annotated_vcf, is_gzipped(annotated_vcf))
-    except Exception as e:
-        logger.debug("Simple-extract detection failed: %s", e)
+    def _basename_no_vcf_ext(path):
+        base = os.path.basename(path)
+        for ext in (".vcf.gz", ".vcf.bgz", ".vcf", ".bgz", ".gz"):
+            if base.lower().endswith(ext):
+                return base[:-len(ext)]
+        # fallback: strip single extension if any
+        return os.path.splitext(base)[0]
 
-    # Do not keep parental pysam handles for trio-based fetch.
-    # Parents will be parsed separately as mono-samples (if separate VCFs provided),
-    # but we do not keep open handles for parental lookups to avoid trio logic.
-    dad_vf = None
-    mom_vf = None
+    vcf_samples = []
 
-    if use_simple_extract:
-        # Use appropriate opener for gzipped or plain VCF regardless of filename extension
-        openf = gzip.open if (str(annotated_vcf).endswith((".gz", ".bgz")) or is_gzipped(annotated_vcf)) else open
-        sample_to_use = proband_sample or sample_name_from_header or "proband"
-        logger.info("Detected SQLiteExport-style VCF; using fast parser (create_variant_from_extract_line).")
-        with openf(annotated_vcf, "rt", encoding="utf-8", errors="ignore") as fh:
-            line_no = 0
-            for ln in fh:
-                line_no += 1
-                if ln.startswith("#"):
-                    continue
-                ln = ln.rstrip("\r\n")
-                if not ln:
-                    continue
-                # Prefer tab-splitting (most VCFs), fallback to generic whitespace split
-                fields = re.split(r'\t+', ln)
-                if len(fields) < 10:
-                    fields = ln.split()
-                if len(fields) < 9:
-                    logger.debug("Skipping line %d: not enough columns (found %d). Preview: %r", line_no, len(fields), ln[:200])
-                    continue
-                try:
-                    vr = create_variant_from_extract_line(fields, sample_name=sample_to_use)
-                except Exception as e:
-                    logger.debug("Failed to create VariantRecord from line %d: %s", line_no, e)
-                    continue
+    proband_name = proband_sample if proband_sample else _basename_no_vcf_ext(working_vcf)
+
+    vcf_samples.append({
+        "path": working_vcf,
+        "name": proband_name,
+        "role": "proband"
+    })
+
+    if father_vcf and os.path.exists(father_vcf):
+        fname = get_sample_names_from_vcf_header(father_vcf)
+        vcf_samples.append({
+            "path": father_vcf,
+            "name": fname[0] if fname else "Father",
+            "role": "father"
+        })
+
+    if mother_vcf and os.path.exists(mother_vcf):
+        mname = get_sample_names_from_vcf_header(mother_vcf)
+        vcf_samples.append({
+            "path": mother_vcf,
+            "name": mname[0] if mname else "Mother",
+            "role": "mother"
+        })
+
+    logger.info(f"Will process {len(vcf_samples)} sample(s): {[s['name'] for s in vcf_samples]}")
+
+    all_candidates: List[VariantRecord] = []
+
+    for vcf_info in vcf_samples:
+        logger.info(f"Parsing {vcf_info['role']} ({vcf_info['name']}) from {vcf_info['path']}")
+        
+        vcf_reader = None
+        if HAVE_PYSAM:
+            try:
+                vcf_reader = pysam.VariantFile(vcf_info["path"])
+            except Exception as e:
+                logger.warning(f"Failed to open {vcf_info['path']} with pysam: {e}")
+        
+        if vcf_reader is None and HAVE_CYVCF2:
+            try:
+                from cyvcf2 import VCF
+                vcf_reader = VCF(vcf_info["path"])
+            except Exception as e:
+                logger.warning(f"Failed to open {vcf_info['path']} with cyvcf2: {e}")
+        
+        if vcf_reader is None:
+            logger.error(f"Cannot open {vcf_info['path']} with any library")
+            continue
+        
+        iterator = vcf_reader.fetch() if hasattr(vcf_reader, 'fetch') else vcf_reader
+        
+        record_count = 0
+        for rec in iterator:
+            record_count += 1
+            try:
+                vr = build_variant_record_from_rec(
+                    rec=rec,
+                    acmg_genes_normalized=acmg_genes_normalized,
+                    dad_vf=None,
+                    mom_vf=None,
+                    exons_df=exons_df,
+                    proband_sample=vcf_info["name"],
+                    require_mane=require_mane,
+                    dbm=dbm
+                )
                 if not vr:
                     continue
-                # annotate and append exactly once
+                
                 vr.sample_sex = inferred_sex
-                try:
-                    if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm is not None:
+                vr.sample_role = vcf_info["role"]  
+                
+                if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm is not None:
+                    try:
                         dbm.annotate_gnomad_for_variant(vr)
-                except Exception:
-                    logger.debug("gnomAD annotation failed for line %d", line_no, exc_info=True)
+                    except Exception:
+                        pass
+                
+                # DB evidence
                 try:
                     if dbm is not None:
                         vr.db_hits.extend(dbm.get_variant_db_evidence(vr))
                 except Exception:
-                    logger.debug("DB evidence lookup failed for line %d", line_no, exc_info=True)
-                candidates.append(vr)
-    else:
-       # Debug/force block removed. Fall back to cyvcf2/pysam reader below.
-       pass    
+                    pass
+                
+                all_candidates.append(vr)
+                
+            except Exception as e:
+                logger.debug(f"Skipping record {record_count} in {vcf_info['name']}: {e}")
+                continue
+        
+        if hasattr(vcf_reader, 'close'):
+            try:
+                vcf_reader.close()
+            except:
+                pass
+        
+        logger.info(f"  {vcf_info['name']}: parsed {record_count} records, {len([c for c in all_candidates if c.sample == vcf_info['name']])} candidates")
 
-    # Parse a VCF-like file in "simple-extract" format and append VariantRecord objects
-    # for every sample column found in the file. This creates independent mono-sample VariantRecord
-    # entries even for parents' VCFs.
-    def parse_and_append_vcf_mono(vcf_path: str, candidates_list: List[VariantRecord],
-                                dbm_obj: Optional[DatabaseManager], inferred_sex_val: str,
-                                preferred_sample: Optional[str] = None):
-        """
-        Parse the provided VCF or annotated TSV (gz or plain). For every sample column present in the file
-        create a separate VariantRecord by using create_variant_from_extract_line(fields, sample_name=sample).
-        Annotate each record with gnomAD/DB evidence (using dbm_obj) and append to candidates_list.
+    candidates = deduplicate_candidates(all_candidates)
+    logger.info(f"Total candidates after dedup: {len(candidates)}")
 
-        This function intentionally treats each sample independently (mono-sample analysis).
-        """
-        import gzip
-
-        if not vcf_path or not os.path.exists(vcf_path):
-            return
-
-        openf = gzip.open if (str(vcf_path).endswith((".gz", ".bgz")) or is_gzipped(vcf_path)) else open
-
-        # read header and first data line to determine sample names
-        header_sample_line = None
-        first_data_line = None
-        try:
-            with openf(vcf_path, "rt", encoding="utf-8", errors="ignore") as fh:
-                for ln in fh:
-                    if ln.startswith("#CHROM"):
-                        header_sample_line = ln.rstrip("\n")
-                        # keep reading until data begins
-                        continue
-                    if not ln.startswith("#"):
-                        first_data_line = ln.rstrip("\n")
-                        break
-        except Exception:
-            # if header read fails, we will attempt a streaming parse below
-            header_sample_line = None
-
-        if header_sample_line:
-            header_parts = re.split(r'\t+', header_sample_line)
-            sample_names = header_parts[9:] if len(header_parts) > 9 else []
-        else:
-            # fallback to preferred_sample or a generic name
-            sample_names = [preferred_sample] if preferred_sample else ["sample"]
-
-        # Re-open and stream parse all data lines, creating a mono-VariantRecord per sample column
-        try:
-            with openf(vcf_path, "rt", encoding="utf-8", errors="ignore") as fh:
-                line_no = 0
-                for ln in fh:
-                    line_no += 1
-                    if ln.startswith("#"):
-                        continue
-                    ln = ln.rstrip("\r\n")
-                    if not ln:
-                        continue
-                    parts = re.split(r'\t+', ln)
-                    if len(parts) < 9:
-                        parts = ln.split()
-                    if len(parts) < 9:
-                        # skip malformed line
-                        continue
-
-                    num_samples_in_line = max(0, len(parts) - 9)
-                    # determine effective sample names for this line
-                    effective_sample_names = sample_names[:num_samples_in_line] if num_samples_in_line > 0 else sample_names
-
-                    # if no per-sample columns, still create one record for the preferred sample
-                    if num_samples_in_line == 0 and effective_sample_names:
-                        fp = list(parts)
-                        while len(fp) < 10:
-                            fp.append(".")
-                        try:
-                            vr = create_variant_from_extract_line(fp, sample_name=effective_sample_names[0])
-                        except Exception:
-                            continue
-                        vr.sample_sex = inferred_sex_val
-                        try:
-                            if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm_obj is not None:
-                                dbm_obj.annotate_gnomad_for_variant(vr)
-                        except Exception:
-                            pass
-                        try:
-                            if dbm_obj is not None:
-                                vr.db_hits.extend(dbm_obj.get_variant_db_evidence(vr))
-                        except Exception:
-                            pass
-                        candidates_list.append(vr)
-                        continue
-
-                    # iterate sample columns and create one VariantRecord per sample
-                    for si, sname in enumerate(effective_sample_names):
-                        sample_col_index = 9 + si
-                        if sample_col_index >= len(parts):
-                            continue
-                        fields_for_sample = list(parts[:9])  # CHROM..FORMAT
-                        fields_for_sample.append(parts[sample_col_index])
-                        try:
-                            vr = create_variant_from_extract_line(fields_for_sample, sample_name=sname or preferred_sample or f"sample_{si}")
-                        except Exception:
-                            continue
-                        vr.sample_sex = inferred_sex_val
-                        try:
-                            if (vr.gnomad_af is None or vr.gnomad_af == 0.0) and dbm_obj is not None:
-                                dbm_obj.annotate_gnomad_for_variant(vr)
-                        except Exception:
-                            pass
-                        try:
-                            if dbm_obj is not None:
-                                vr.db_hits.extend(dbm_obj.get_variant_db_evidence(vr))
-                        except Exception:
-                            pass
-                        candidates_list.append(vr)
-        except Exception:
-            # be resilient to I/O errors; caller will continue with whatever appended
-            return
-
+    # DIAGNOSTICS 
     logger.info("DEBUG: parsed candidates count = %d", len(candidates))
+    for i, vv in enumerate(candidates[:10]):
+        try:
+            logger.info("CAND[%d] sample=%s gene=%s hgvsp=%s hgvsc=%s consequence=%s gt=%s dp=%s af=%s gnomad_af=%s",
+                        i, getattr(vv, "sample", "?"), getattr(vv, "gene", ""),
+                        getattr(vv, "hgvsp", ""), getattr(vv, "hgvsc", ""),
+                        getattr(vv, "consequence", ""), getattr(vv, "proband_gt", ""),
+                        getattr(vv, "proband_dp", ""), getattr(vv, "proband_af", ""),
+                        getattr(vv, "gnomad_af", ""))
+        except Exception:
+            logger.exception("Failed printing candidate %d", i)
 
-    # If separate parental VCF paths were provided, parse them as independent mono-samples
-    # and append their VariantRecord entries to the candidates list (parents are not treated as trio).
-    if father_vcf and os.path.exists(father_vcf):
-        logger.info("Parsing father VCF as mono-samples: %s", father_vcf)
-        parse_and_append_vcf_mono(father_vcf, candidates, dbm, inferred_sex, preferred_sample=None)
+    for v in candidates:
+        if not v.sample:
+            v.sample = proband_sample or "Proband"
+    
+    if len(candidates) == 0:
+        logger.error("No variants were parsed from VCF. Check file format.")
+        return
+    
+    logger.info(f"Total candidates after parsing: {len(candidates)}")
 
-    if mother_vcf and os.path.exists(mother_vcf):
-        logger.info("Parsing mother VCF as mono-samples: %s", mother_vcf)
-        parse_and_append_vcf_mono(mother_vcf, candidates, dbm, inferred_sex, preferred_sample=None)
-
-    # After appending parental files ensure deduplication will treat sample+coords as separate keys
-
+    # DIAGNOSTICS
+    logger.info("DEBUG: parsed candidates count = %d", len(candidates))
     for i, vv in enumerate(candidates[:10]):
         try:
             logger.info("CAND[%d] gene=%s hgvsp=%s hgvsc=%s consequence=%s sample_gt=%s dp=%s af=%s gnomad_af=%s keys=%s",
@@ -8496,6 +9411,7 @@ def process_vcf(proband_vcf: str,
             dropped_count += 1
     
     logger.info(f"After strict QC filtering: {len(filtered_for_report)} kept for Report, {dropped_count} low quality (audit only)")
+
 
     all_path, auto_path, manual_path, cnt_auto, cnt_manual = strict_triage_and_output(
         report_candidates=filtered_for_report,
@@ -8713,6 +9629,11 @@ def process_single_sample_worker(payload):
         dirname = os.path.dirname(p_vcf)
         filename = os.path.basename(p_vcf)
         dna_id = filename.split('_')[0]
+        for ext in ['.vcf.gz', '.vcf.bgz', '.vcf', '.bgz', '.gz']:
+            if dna_id.endswith(ext):
+                dna_id = dna_id[:-len(ext)]
+                break
+        
         map_id = os.path.basename(dirname)
         s_out = os.path.join(args_dict.outdir, "individual_results", dna_id)
         siblings = glob.glob(os.path.join(dirname, "*"))
@@ -8765,19 +9686,34 @@ def run_batch_mode(args, db_paths):
         os.path.join(args.batch_input_dir, "**", "*_sample*.vcf*"),
         os.path.join(args.batch_input_dir, "**", "*_proband*.vcf"),
         os.path.join(args.batch_input_dir, "**", "*_sample*.vcf"),
+        os.path.join(args.batch_input_dir, "**", "*.vcf*"),
+
     ]
-    # aggregate unique
+    # aggregate unique VCF files
     proband_files = []
     for p in patterns:
         proband_files.extend(glob.glob(p, recursive=True))
     proband_files = sorted(list(set(proband_files)))
     if not proband_files:
-        logger.error("No *_proband.vcf files found")
+        logger.error("No VCF files found (searched patterns: %s)", patterns)
         sys.exit(1)
-    logger.info(f"Found {len(proband_files)} samples. Using ProcessPoolExecutor.")
-    tasks = [(f, args, db_paths) for f in proband_files]
+    logger.info(f"Found {len(proband_files)} VCF files. Using ProcessPoolExecutor.")
+
+    tasks = []
+    for f in proband_files:
+        try:
+            samples = get_sample_names_from_vcf_header(f)
+            if samples:
+                sample_name = samples[0]
+            else:
+                # fallback to filename (basename without extension)
+                sample_name = os.path.splitext(os.path.basename(f))[0]
+        except Exception:
+            sample_name = os.path.splitext(os.path.basename(f))[0]
+        tasks.append((f, args, db_paths))
+
     results_meta = []
-    MAX_WORKERS = 10
+    MAX_WORKERS = 7
     with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_single_sample_worker, task) for task in tasks]
         for future in concurrent.futures.as_completed(futures):
