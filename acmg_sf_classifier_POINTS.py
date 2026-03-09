@@ -1689,9 +1689,24 @@ class DatabaseManager:
                 vidcol = find_col(['variationid', 'variation_id', 'variation id', 'variationid', 'VariationID'])
                 phencol = find_col(['reportedphenotypeinfo', 'reported_phenotype_info', 'phenotype', 'reportedphenotype', 'ReportedPhenotypeInfo'])
                 # significance candidates (order of preference)
-                sig_candidates = ['VCF_CLNSIG', 'VCF_CLINICAL_SIGNIFICANCE', 'ClinicalSignificance', 'clinsig', 'clnsig','clinical_significance', 'clinicalsignificance']
+                sig_candidates = [
+                    'ClinicalSignificance',      
+                    'clinical_significance',
+                    'clinicalsignificance',
+                    'clinsig',
+                    'clnsig',
+                    'VCF_CLINICAL_SIGNIFICANCE',
+                    'VCF_CLNSIG'                
+                ]                
                 # review/status and other columns
-                revcol = find_col(['vcf_clnrevstat', 'reviewstatus', 'review_stat', 'review', 'ReviewStatus'])
+                revcol = find_col([
+                    'ReviewStatus',              
+                    'reviewstatus',
+                    'review_stat',
+                    'review',
+                    'vcf_clnrevstat',            
+                    'VCF_CLNREVSTAT'
+                ])
                 sidcol = find_col(['submissionid', 'submission_id', 'submission', 'SubmissionID'])
                 hgvscol = find_col(['hgvs_protein', 'hgvs_prot', 'hgvsp', 'HGVS_Protein', 'protein'])
                 genecol = find_col(['genesymbol', 'gene', 'gene_symbol', 'symbol', 'GeneSymbol'])
@@ -2381,14 +2396,24 @@ class DatabaseManager:
 
                             # fallback: if vr.clinvar_sig already contains tokens (e.g., from VCF lookup), include them
                             existing_sig = getattr(vr, "clinvar_sig", "") or ""
+                            existing_stars_raw = str(getattr(vr, "clinvar_stars", "") or "")
+
+                            if existing_stars_raw and ";" in existing_stars_raw:
+                                existing_stars_parts = [s.strip() for s in existing_stars_raw.split(";")]
+                            else:
+                                existing_stars_parts = [existing_stars_raw] if existing_stars_raw else []
+
                             if existing_sig and str(existing_sig).strip() and str(existing_sig).strip().lower() not in ("not provided", ".", "null", "none"):
                                 try:
                                     parts = re.split(r'[;,\|/]+', str(existing_sig))
-                                    for p in parts:
+                                    for idx, p in enumerate(parts):
                                         p2 = p.strip()
                                         if p2:
                                             _clin_sigs_all.append(p2)
-                                            _clin_stars_all.append(getattr(vr, "clinvar_stars", ""))
+                                            if idx < len(existing_stars_parts):
+                                                _clin_stars_all.append(existing_stars_parts[idx])
+                                            else:
+                                                _clin_stars_all.append("")
                                 except Exception:
                                     pass
 
@@ -4502,10 +4527,10 @@ class ACMGEngine:
         rule = self._get_gene_rule(vr.gene) if hasattr(self, "_get_gene_rule") else {}
         acmg_disease = str(rule.get("disease", "") or "").strip()
 
-        # --- ClinVar block ---
+        # --- ClinVar block (Atomic submission evaluation) ---
         clin_block_raw = 0.0
         clin_match_flag = False
-
+        
         CLIN_BASE_MAP = {
             "pathogenic": 3,
             "likely pathogenic": 2,
@@ -4518,31 +4543,28 @@ class ACMGEngine:
         CLIN_STAR_COEF = {5: 2.0, 4: 1.5, 3: 1.25, 2: 1.0, 1: 0.75, 0: 0.5}
 
         try:
-            # filter out skipped:
+            # Filter out skipped submissions (gene mismatch)
             skipped_ids = {s.get("submission_id") for s in getattr(vr, "_clinvar_submissions_skipped", []) or []}
             clin_subs = [s for s in getattr(vr, "clinvar_submissions", []) or [] if s.get("submission_id") not in skipped_ids]
             
+            best_valid_score = 0.0
+            best_submission_info = None
+
             if clin_subs:
-                best_base = 0
-                best_stars = 0
-                matched_any = False
-                
                 for sub in clin_subs:
                     sig_raw = str(sub.get("clnsig", "") or "").strip()
                     phen = str(sub.get("phenotype", "")).strip()
                     stars = int(sub.get("stars", 0) or 0)
                     sig_norm = re.sub(r'[_\s]+', ' ', sig_raw.lower().strip())
-
+                    
+                    # 1. Determine Base Score for THIS submission
                     sub_base = 0
-
-                    # Conflict detection first
                     if re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', sig_norm):
-                        sub_base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1))
+                        sub_base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1)
                     else:
                         has_likely = bool(re.search(r'\blikely\s+pathogenic\b', sig_norm))
                         has_path = bool(re.search(r'\bpathogenic\b', sig_norm))
                         if has_path and has_likely:
-                            # single submission contains both -> treat as Pathogenic (user requirement)
                             sub_base = CLIN_BASE_MAP.get("pathogenic", 3)
                         elif has_path:
                             sub_base = CLIN_BASE_MAP.get("pathogenic", 3)
@@ -4553,105 +4575,56 @@ class ACMGEngine:
                         elif re.search(r'\bbenign\b', sig_norm) and 'pathogen' not in sig_norm:
                             sub_base = CLIN_BASE_MAP.get("benign", -3)
                         elif 'uncertain' in sig_norm or 'vus' in sig_norm:
-                            sub_base = CLIN_BASE_MAP.get("uncertain significance", CLIN_BASE_MAP.get("uncertain significance", -1))
-                        else:
-                            # fallback: leave sub_base 0 (unknown/uninterpretable)
-                            sub_base = 0
+                            sub_base = CLIN_BASE_MAP.get("uncertain significance", -1)
                     
-                    if abs(sub_base) > abs(best_base):
-                        best_base = sub_base
-                        best_stars = stars
+                    # 2. Calculate Final Score for THIS submission (Base * Star Coef)
+                    # IMPORTANT: Stars apply ONLY to this submission's classification
+                    coef = CLIN_STAR_COEF.get(stars, 0.5)
+                    sub_score = float(sub_base) * float(coef)
                     
-                    if acmg_disease and phen and not matched_any:
+                    # 3. Check Phenotype Match for THIS submission
+                    sub_phen_match = False
+                    if acmg_disease and phen:
                         try:
                             matched, match_level, match_reason = check_disease_match(acmg_disease, phen)
                             if matched:
-                                clin_match_flag = True
-                                matched_any = True
-                                vr._clinvar_phenotype_match = True
-                                vr._clinvar_phenotype_match_level = match_level or ""
-                                vr._clinvar_phenotype_match_reason = match_reason or ""
+                                sub_phen_match = True
                         except Exception:
                             pass
-                
-                coef = CLIN_STAR_COEF.get(best_stars, 0.5)
-                clin_block_raw = float(best_base) * float(coef)
-                
-                if not clin_match_flag and clin_block_raw != 0:
-                    if clin_block_raw > 1.0:
-                        clin_block_raw = 1.0
-                    elif clin_block_raw < -1.0:
-                        clin_block_raw = -1.0
-                
-                if not clin_match_flag:
-                    vr._clinvar_phenotype_match = False
-                    vr._clinvar_phenotype_match_level = "no_phenotype_match"
-                    vr._clinvar_phenotype_match_reason = "No phenotype matched ACMG disease"
+                    
+                    # 4. Apply Phenotype Penalty if no match for THIS submission
+                    # If phenotype doesn't match, cap the score to [-1.0, +1.0] regardless of stars/class
+                    if not sub_phen_match and sub_score != 0:
+                        if sub_score > 1.0:
+                            sub_score = 1.0
+                        elif sub_score < -1.0:
+                            sub_score = -1.0
+                    
+                    # 5. Track the best valid submission
+                    # We want the maximum absolute impact, preferring Pathogenic over Benign if magnitudes are equal
+                    if abs(sub_score) > abs(best_valid_score):
+                        best_valid_score = sub_score
+                        best_submission_info = {
+                            "sig": sig_raw,
+                            "stars": stars,
+                            "phen": phen,
+                            "match": sub_phen_match
+                        }
+                        if sub_phen_match:
+                            clin_match_flag = True
+
+            # Assign final block score from the best single submission
+            clin_block_raw = best_valid_score
+            
+            # Persist metadata for the best submission found
+            if best_submission_info:
+                vr._clinvar_phenotype_match = best_submission_info["match"]
+                vr._clinvar_phenotype_match_level = "submission_level" if best_submission_info["match"] else "no_match"
+                vr._clin_block_raw_display = f"{clin_block_raw:.3f}"
+                vr._best_clinvar_sub = best_submission_info
             else:
-                agg_sig = str(vr.clinvar_sig or "").strip()
-                
-                if agg_sig and agg_sig.lower() not in ("not provided", "", ".", "null", "none"):
-                    agg_stars = 0
-                    try:
-                        agg_stars = int(float(str(vr.clinvar_stars or "0")))
-                    except (ValueError, TypeError):
-                        agg_stars = 0
-                    
-                    parts = re.split(r'[;,\|/]+', agg_sig.lower())
-                    parts = [p.strip().replace("_", " ") for p in parts if p.strip()]
-                    
-                    base = 0
-                    has_pathogenic = False
-                    has_likely_pathogenic = False
-                    
-                    for p in parts:
-                        p_clean = p.strip()
-                        if p_clean == "likely pathogenic" or "likely pathogenic" in p_clean:
-                            has_likely_pathogenic = True
-                        elif "pathogenic" in p_clean and "likely" not in p_clean:
-                            has_pathogenic = True
-                    
-                    if has_pathogenic:
-                        base = CLIN_BASE_MAP.get("pathogenic", 3)
-                    elif has_likely_pathogenic:
-                        base = CLIN_BASE_MAP.get("likely pathogenic", 2)
-                    elif "conflict" in " ".join(parts):
-                        base = CLIN_BASE_MAP.get("conflicting classifications of pathogenicity", -1)
-                    elif any("benign" in p for p in parts):
-                        has_benign = any(p == "benign" or (p == "benign" and "likely" not in p) for p in parts)
-                        has_likely_benign = any("likely benign" in p for p in parts)
-                        
-                        if has_benign:
-                            base = CLIN_BASE_MAP.get("benign", -3)
-                        elif has_likely_benign:
-                            base = CLIN_BASE_MAP.get("likely benign", -2)
-                    elif any("uncertain" in p or "vus" in p for p in parts):
-                        base = CLIN_BASE_MAP.get("uncertain significance", -1)
-                    
-                    coef = CLIN_STAR_COEF.get(agg_stars, 0.5)
-                    clin_block_raw = float(base) * float(coef)
-                    
-                    # Check phenotype match 
-                    clinvar_trait_text = str(vr.clinvar_trait or "")
-                    clin_match_flag = False
-                    if acmg_disease and clinvar_trait_text:
-                        try:
-                            matched, match_level, match_reason = check_disease_match(acmg_disease, clinvar_trait_text)
-                            clin_match_flag = bool(matched)
-                            vr._clinvar_phenotype_match = clin_match_flag
-                            vr._clinvar_phenotype_match_level = match_level or ""
-                            vr._clinvar_phenotype_match_reason = match_reason or ""
-                        except Exception:
-                            clin_match_flag = False
-                    
-                    if not clin_match_flag and clin_block_raw != 0:
-                        if clin_block_raw > 1.0:
-                            clin_block_raw = 1.0
-                        elif clin_block_raw < -1.0:
-                            clin_block_raw = -1.0
-                else:
-                    clin_block_raw = 0.0
-                    clin_match_flag = False
+                vr._clinvar_phenotype_match = False
+                vr._clin_block_raw_display = "0.000"
 
         except Exception as e:
             logger.debug(f"ClinVar block calculation failed: {e}")
@@ -5974,9 +5947,9 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
 
     # Join fields with semicolon separator to create output strings
     # Submissions are listed in order with parallel fields (sig;sig;sig vs trait;trait;trait vs stars;stars;stars)
-    clinvar_sig_field = ";".join(clin_sigs) if clin_sigs else (v.clinvar_sig or "Not provided")
+    clinvar_sig_field = ";".join(clin_sigs) if clin_sigs else "Not provided"
     clinvar_trait_field = ";".join(clin_phens) if clin_phens else (v.clinvar_trait or "Not provided")
-    clinvar_stars_field = ";".join(clin_stars_seq) if clin_stars_seq else (str(v.clinvar_stars) if v.clinvar_stars else "0")
+    clinvar_stars_field = ";".join(clin_stars_seq) if clin_stars_seq else "0"
 
     # Set phenotype match flags for downstream processing
     # Combines the result from CSV submissions with any VCF-level phenotype match
@@ -8967,8 +8940,12 @@ def compute_class_from_points(criteria_points: Dict[str,int]) -> Tuple[str,int,i
         auto_class = "Likely benign"
     else:
         auto_class = "VUS"
+    if auto_class == "Pathogenic" and path_cnt <= 2:
+        auto_class = "Likely pathogenic"
+
     if (auto_class.startswith("Path") or auto_class.startswith("Likely path")) and path_cnt < MIN_PATHOGENIC_CRITERIA:
         auto_class = "VUS"
+        
     return auto_class, total, path_cnt
 
 # ---------------------------
