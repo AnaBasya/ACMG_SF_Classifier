@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-12T20:08:04Z",
+  "timestamp": "2026-03-12T20:29:56Z",
   "proband_vcf": "./data/batch_sql/11314_2025/7140780.vcf",
   "annotated_vcf": "./points_no_vep_results/individual_results/7140780/7140780.acmg_only.vcf.gz",
   "candidates_pre_qc": 278,
