@@ -89,8 +89,8 @@ logger = logging.getLogger("acmg_sf_classifier")
 # ---------------------------
 DB_PATHS_DEFAULT = {
     "CLINVAR_VCF": "databases/clinvar/clinvar_with_protein.vcf.gz",
-    "CLINVAR_EXPANDED_CSV": "databases/clinvar/clinvar_expanded.mane_filtered.csv" 
-
+    "CLINVAR_EXPANDED_CSV": "databases/clinvar/clinvar_expanded_acmg_sf.csv",
+    "CLINVAR_CONDITIONS_CSV": "databases/clinvar/clinvar_conditions_acmg_sf.csv"  
 }
 
 THRESH = {
@@ -288,6 +288,9 @@ class VariantRecord:
 
     filtered_reasons: List[str] = field(default_factory=list)
     auto_report_reasons: List[str] = field(default_factory=list)
+
+    _clinvar_scoring_details: Dict[str, Any] = field(default_factory=dict)
+    _hgmd_scoring_details: Dict[str, Any] = field(default_factory=dict)
 
 # ---------------------------
 # Utilities
@@ -1422,6 +1425,13 @@ class DatabaseManager:
                 self._load_clinvar_expanded_csv(exp_path)
             except Exception:
                 logger.warning("Failed to load CLINVAR_EXPANDED_CSV: %s", exp_path)
+        self.clinvar_conditions_index = {}  # {(Query_Variant, Phenotype): consensus_dict}
+        cond_path = self.paths.get("CLINVAR_CONDITIONS_CSV")
+        if cond_path and os.path.exists(cond_path):
+            try:
+                self._load_clinvar_conditions_csv(cond_path)
+            except Exception as e:
+                logger.warning(f"Failed to load CLINVAR_CONDITIONS_CSV: {e}")
 
     def _open_clinvar(self):
         p = self.paths.get("CLINVAR_VCF")
@@ -1637,17 +1647,24 @@ class DatabaseManager:
             if not review_text:
                 return 0
             low = str(review_text).lower()
+            
             if 'practice_guideline' in low or 'practice guideline' in low:
                 return 4
+            
             if 'expert_panel' in low or 'expert panel' in low:
                 return 3
-            # heuristics for 2 stars: criteria_provided + multiple_submitters + no_conflict
-            if 'criteria_provided' in low and ('multiple_submitters' in low or 'multiple submitters' in low):
-                if 'no_conflict' in low or 'no conflict' in low or 'no_conflicts' in low:
+            
+            has_criteria = 'criteria_provided' in low or 'criteria provided' in low
+            has_multiple = 'multiple_submitters' in low or 'multiple submitters' in low
+            has_no_conflict = any(x in low for x in ['no_conflict', 'no conflict', 'no_conflicts', 'no conflicts'])
+            
+            if has_criteria and has_multiple:
+                if has_no_conflict or has_multiple:
                     return 2
+            
+            if has_criteria:
                 return 1
-            if 'criteria_provided' in low or 'criteria provided' in low:
-                return 1
+            
             return 0
 
         def safe_first_nonempty(row, candidates):
@@ -1700,12 +1717,16 @@ class DatabaseManager:
                 ]                
                 # review/status and other columns
                 revcol = find_col([
-                    'ReviewStatus',              
-                    'reviewstatus',
+                    'VCF_CLNREVSTAT',    
+                    'vcf_clnrevstat',
+                    'CLNREVSTAT',
+                    'clnrevstat',
+                    'ReviewStatus',      
+                    'reviewstatus', 
                     'review_stat',
                     'review',
-                    'vcf_clnrevstat',            
-                    'VCF_CLNREVSTAT'
+                    'review_status',
+                    'Review_Status',
                 ])
                 sidcol = find_col(['submissionid', 'submission_id', 'submission', 'SubmissionID'])
                 hgvscol = find_col(['hgvs_protein', 'hgvs_prot', 'hgvsp', 'HGVS_Protein', 'protein'])
@@ -1765,14 +1786,23 @@ class DatabaseManager:
 
                         stars = normalize_review_to_stars(review)
 
+                        consensus_sig = safe_first_nonempty(r, ['Consensus_Classification', 'consensus_classification'])
+                        
                         entry = {
                             "phenotype": phen,
-                            "clnsig": clnsig,
+                            "clnsig": clnsig if not consensus_sig else consensus_sig,  
                             "review": review,
                             "submission_id": sid,
-                            "hgvsp": hgvsp,
+                            "hgvsp": hgvsp, 
                             "gene": gene,
-                            "stars": stars
+                            "stars": stars,
+                            "aggregate_stars": int(r.get('Aggregate_Stars', stars) or stars),
+                            "is_consensus": bool(consensus_sig),
+                            "chrom": r.get('Chromosome', r.get('chrom', '')),
+                            "pos": r.get('PositionVCF', r.get('pos', '')),
+                            "ref": r.get('ReferenceAlleleVCF', r.get('ref', '')),
+                            "alt": r.get('AlternateAlleleVCF', r.get('alt', '')),
+                            "consensus_classification": consensus_sig
                         }
 
                         if vid is not None:
@@ -1870,15 +1900,24 @@ class DatabaseManager:
 
                                 stars = normalize_review_to_stars(review)
 
+                                consensus_sig = safe_first_nonempty(r, ['Consensus_Classification', 'consensus_classification'])
                                 entry = {
                                     "phenotype": phen,
-                                    "clnsig": clnsig,
+                                    "clnsig": clnsig if not consensus_sig else consensus_sig,  
                                     "review": review,
                                     "submission_id": sid,
-                                    "hgvsp": hgvsp,
+                                    "hgvsp": hgvsp, 
                                     "gene": gene,
-                                    "stars": stars
+                                    "stars": stars,
+                                    "aggregate_stars": int(r.get('Aggregate_Stars', stars) or stars),
+                                    "is_consensus": bool(consensus_sig),
+                                    "chrom": r.get('Chromosome', r.get('chrom', '')),
+                                    "pos": r.get('PositionVCF', r.get('pos', '')),
+                                    "ref": r.get('ReferenceAlleleVCF', r.get('ref', '')),
+                                    "alt": r.get('AlternateAlleleVCF', r.get('alt', '')),
+                                   "consensus_classification": consensus_sig
                                 }
+
                                 if vid is not None:
                                     self.clinvar_expanded_by_vid[int(vid)].append(entry)
                                 if qv:
@@ -1927,6 +1966,65 @@ class DatabaseManager:
         except Exception as e:
             logger.warning(f"Failed to load clinvar_expanded CSV with fallback parser: {e}", exc_info=True)
             return
+
+    def _load_clinvar_conditions_csv(self, path: str) -> None:
+        """
+        Load clinvar_conditions_acmg_sf.csv with consensus classifications per variant+phenotype.
+        Builds index: {(Query_Variant, ReportedPhenotypeInfo): {'Consensus_Classification', 'Aggregate_Stars', ...}}
+        """
+        if not path or not os.path.exists(path):
+            logger.warning(f"ClinVar conditions CSV not found: {path}")
+            return
+        
+        logger.info(f"Loading ClinVar conditions summary: {path}")
+        self.clinvar_conditions_index = {}
+        
+        try:
+            if HAVE_PANDAS:
+                df = pd.read_csv(path, sep=',', dtype=str, on_bad_lines='skip').fillna("")
+                cols_lower = {c.lower().strip(): c for c in df.columns}
+                
+                # Find columns (flexible matching)
+                def find_col(candidates):
+                    for c in candidates:
+                        if c and c.lower() in cols_lower:
+                            return cols_lower[c.lower()]
+                    return None
+                
+                qvar_col = find_col(['query_variant', 'queryvariant', 'qvar'])
+                phen_col = find_col(['reportedphenotypeinfo', 'phenotype', 'reported_phenotype'])
+                consensus_col = find_col(['consensus_classification', 'consensus_class', 'classification'])
+                agg_stars_col = find_col(['aggregate_stars', 'agg_stars', 'stars'])
+                
+                for _, r in df.iterrows():
+                    try:
+                        qvar = str(r.get(qvar_col, "") or "").strip()
+                        phen = str(r.get(phen_col, "") or "").strip()
+                        consensus = str(r.get(consensus_col, "") or "").strip()
+                        agg_stars = str(r.get(agg_stars_col, "") or "").strip()
+                        
+                        if qvar:
+                            key = (qvar, phen)
+                            self.clinvar_conditions_index[key] = {
+                                'Consensus_Classification': consensus if consensus else "Uncertain significance",
+                                'Aggregate_Stars': agg_stars if agg_stars else "0"
+                            }
+                            # Also index without phenotype for fallback
+                            if phen:
+                                key_no_phen = (qvar, "")
+                                if key_no_phen not in self.clinvar_conditions_index:
+                                    self.clinvar_conditions_index[key_no_phen] = {
+                                        'Consensus_Classification': consensus if consensus else "Uncertain significance",
+                                        'Aggregate_Stars': agg_stars if agg_stars else "0"
+                                    }
+                    except Exception:
+                        continue
+                
+                logger.info(f"✓ Loaded {len(self.clinvar_conditions_index)} condition entries from conditions CSV")
+            else:
+                logger.warning("Pandas not available, skipping conditions CSV load")
+        except Exception as e:
+            logger.warning(f"Failed to parse conditions CSV: {e}")
 
     def _get_expanded_submissions_for_variant(self, variation_id: Optional[int], qvar: Optional[str]) -> List[Dict]:
         """
@@ -2527,6 +2625,34 @@ class DatabaseManager:
                         logger.debug("Error processing expanded ClinVar submission: %s", e)
                         continue
             
+            if hasattr(self, 'clinvar_conditions_index') and self.clinvar_conditions_index:
+                # Try to match by Query_Variant + phenotype
+                qvar_key = f"{vr.chrom}-{int(vr.pos)}-{vr.ref}-{vr.alt}"
+                
+                # First try with phenotype match
+                consensus_found = False
+                for s in getattr(vr, "clinvar_submissions", []) or []:
+                    phen = s.get("phenotype", "")
+                    key = (qvar_key, phen)
+                    if key in self.clinvar_conditions_index:
+                        cond = self.clinvar_conditions_index[key]
+                        vr._clinvar_consensus_class = cond.get('Consensus_Classification', "Not provided")
+                        vr._clinvar_consensus_stars = cond.get('Aggregate_Stars', "0")
+                        vr._clinvar_phenotype_match_method = "conditions_csv_phenotype_match"
+                        consensus_found = True
+                        logger.debug(f"Found consensus for {qvar_key} + {phen}: {vr._clinvar_consensus_class}")
+                        break
+                
+                # Fallback: try without phenotype (general consensus for variant)
+                if not consensus_found:
+                    key_general = (qvar_key, "")
+                    if key_general in self.clinvar_conditions_index:
+                        cond = self.clinvar_conditions_index[key_general]
+                        vr._clinvar_consensus_class = cond.get('Consensus_Classification', "Not provided")
+                        vr._clinvar_consensus_stars = cond.get('Aggregate_Stars', "0")
+                        vr._clinvar_phenotype_match_method = "conditions_csv_general"
+                        logger.debug(f"Found general consensus for {qvar_key}: {vr._clinvar_consensus_class}")
+
             # Set aggregated ClinVar fields on VariantRecord (only from accepted submissions)
             if clinvar_sigs_collected:
                 # Deduplicate while preserving order
@@ -2850,31 +2976,28 @@ class DatabaseManager:
             logger.warning("ClinVar load error: %s", e)
 
     def find_protein_variant_by_hgvsp(self, gene: str, hgvsp: str, pos_aa: int, transcript: str,
-                                     current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
-                                     current_ref: Optional[str] = None, current_alt: Optional[str] = None,
-                                     acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
+    current_chrom: Optional[str] = None, current_pos: Optional[int] = None,
+    current_ref: Optional[str] = None, current_alt: Optional[str] = None,
+    acmg_disease: Optional[str] = None) -> List[Tuple[str, str, dict]]:
         """
         Phenotype-aware PS1/PM5 lookup using ONLY clinvar_expanded submissions when available.
-        If no expanded submissions are available for the variant, this function returns [] (no fallback).
-        Improved: require gene validation for ClinVar submissions (skip submissions that clearly refer to another gene),
-        but allow submission when HGVSp exactly matches current HGVSp (ties it to the protein).
+        CRITICAL FIX: PS1 requires SAME amino acid change but DIFFERENT nucleotide change.
+        If the database entry has the exact same chrom/pos/ref/alt, it should NOT be returned for PS1.
         """
         if not hgvsp or not gene:
             return []
         qvar_key = None
         if current_chrom and current_pos and current_ref is not None and current_alt is not None:
             qvar_key = f"{current_chrom}-{current_pos}-{current_ref}-{current_alt}"
-
         results = []
         seen = set()
         current_hgvsp_clean = clean_hgvsp(hgvsp)
-
+        
         # Prefer expanded submissions
         expanded = []
         if qvar_key and hasattr(self, "clinvar_expanded_by_qvar"):
             expanded.extend(self.get_submissions_for_query_variant(qvar_key))
-
-        # If expanded is empty, do NOT consult clinvar_with_protein.vcf (by design)
+        
         for s in expanded:
             try:
                 phen = s.get("phenotype","") or ""
@@ -2882,99 +3005,136 @@ class DatabaseManager:
                 s_sig = s.get("clnsig","") or ""
                 sid = s.get("submission_id","") or ""
                 s_gene = s.get("gene","") or s.get("gene_raw","") or ""
+                
+                info = {
+                        "hgvsp": s.get("hgvsp", ""),  # EXPLICITLY include hgvsp
+                        "clnsig": s_sig,
+                        "source": "ClinVar_Submission",
+                        "stars": s.get("aggregate_stars", s.get("stars", 0)),
+                        "phenotype": phen,
+                        "gene": s_gene,
+                        "submission_id": sid,
+                        # Include nucleotide coords for PS1 self-exclusion
+                        "chrom": s.get("chrom", ""),
+                        "pos": s.get("pos", ""),
+                        "ref": s.get("ref", ""),
+                        "alt": s.get("alt", "")
+                    }
 
-                # Gene validation: skip submissions that clearly refer to a different gene,
-                # unless HGVS protein exactly matches.
+                # Gene validation
                 gene_valid, gene_reason = validate_gene_match_db_evidence(gene, s_gene, "ClinVar")
                 if not gene_valid and s_hgvsp != current_hgvsp_clean:
-                    # skip this submission for PS1/PM5 lookup since it appears to be about another gene
                     continue
-
+                
                 # phenotype restriction (if ACMG disease specified)
                 if acmg_disease and phen:
-                    matched, _, _ = check_disease_match(acmg_disease, phen)
+                    acmg_disease_tokens = [d.strip() for d in re.split(r'[;/\|]+', acmg_disease) if d.strip()]
+                    matched = False
+                    for dtk in acmg_disease_tokens:
+                        if not dtk:
+                            continue
+                        m, _, _ = check_disease_match(dtk, phen)
+                        if m:
+                            matched = True
+                            break
                     if not matched:
                         continue
-
+                
+                # === CRITICAL FIX: Exclude exact nucleotide match (variant finding itself) ===
+                # PS1 requires DIFFERENT nucleotide change with SAME amino acid change
+                # If database entry has same chrom/pos/ref/alt, skip it for PS1
+                s_chrom = s.get("chrom", "")
+                s_pos = s.get("pos", "")
+                s_ref = s.get("ref", "")
+                s_alt = s.get("alt", "")
+                
+                # Check if this is the exact same nucleotide variant
+                is_same_nucleotide = False
+                if current_chrom and s_chrom:
+                    if (normalize_chrom(str(current_chrom)) == normalize_chrom(str(s_chrom)) and
+                        str(current_pos) == str(s_pos) and
+                        str(current_ref) == str(s_ref) and
+                        str(current_alt) == str(s_alt)):
+                        is_same_nucleotide = True
+                
+                if is_same_nucleotide:
+                    # This is the same variant - do NOT use for PS1 (variant finding itself)
+                    # But we can still use it to determine if variant itself is in ClinVar
+                    continue
+                
                 key = f"sub:{sid}|{s_sig}|{phen}|{s_hgvsp}|{s_gene}"
                 if key in seen:
                     continue
                 seen.add(key)
-
+                
                 s_sig = str(s.get("clnsig", "") or "").strip()
                 s_sig_norm = re.sub(r'[_\s]+', ' ', s_sig.lower().strip())
-
-                # conflict detection
+                
                 if re.search(r'\bconflict', s_sig_norm):
                     results.append((s_sig, "ClinVar_Submission_Conflicting", s))
                 else:
                     has_likely = bool(re.search(r'\blikely\s+pathogenic\b', s_sig_norm))
                     has_path = bool(re.search(r'\bpathogenic\b', s_sig_norm))
                     if has_path and has_likely:
-                        # single submission includes both -> treat as Pathogenic
-                        results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
+                        results.append((s_sig, "ClinVar_Submission_Pathogenic", info))
                     elif has_path:
-                        results.append((s_sig, "ClinVar_Submission_Pathogenic", s))
+                        results.append((s_sig, "ClinVar_Submission_Pathogenic", info))
                     elif has_likely:
-                        results.append((s_sig, "ClinVar_Submission_Likely_pathogenic", s))
+                        results.append((s_sig, "ClinVar_Submission_Likely_pathogenic", info))
                     else:
                         results.append((s_sig, "ClinVar_Submission", s))
             except Exception:
                 continue
-
+        
         return results
 
     def check_pm5_variants(self, gene: str, pos_aa: int, current_hgvsp: str) -> List[Dict[str, Any]]:
         """
         Checks for other pathogenic/likely-pathogenic variants at the same amino-acid residue.
-        Returns a list of dictionaries with detailed information about matching variants.
+        CRITICAL FIX: PM5 requires DIFFERENT amino acid change at same residue.
+        Must exclude: (1) exact same HGVSp, (2) cases where current variant itself is P/LP in DB.
         """
         if not pos_aa or not gene:
             return []
-
         norm_gene = normalize_gene_name(gene)
         results = []
-
-        # iterate ClinVar protein-index for the gene
+        current_hgvsp_clean = clean_hgvsp(current_hgvsp)
+        
         for entry in self.clinvar_protein_index.get(norm_gene, []):
-            # skip if entry lacks protein annotation or gene mismatch
             entry_hgvsp = entry.get('hgvsp', '')
             if not entry_hgvsp:
                 continue
-
-            # skip exact same protein change (PS1 case)
+            
+            # Skip exact same protein change (this would be PS1, not PM5)
             try:
-                if clean_hgvsp(entry_hgvsp) == clean_hgvsp(current_hgvsp):
+                if clean_hgvsp(entry_hgvsp) == current_hgvsp_clean:
                     continue
             except Exception:
                 pass
-
+            
             # Parse position from entry HGVSp
             entry_pos = extract_aa_position_from_hgvsp(entry_hgvsp)
-            
             if not entry_pos or entry_pos != pos_aa:
                 continue
-
-            # check significance & stars
+            
+            # Check significance & stars
             clnsig_raw = str(entry.get('clnsig', '') or "").strip()
             stars = int(entry.get('stars', 0) or 0)
             if stars < 2:
                 continue
-
+            
             clnsig_norm = re.sub(r'[_\s]+', ' ', clnsig_raw.lower().strip())
-
-            # skip explicit benign entries
+            
+            # Skip benign entries
             if re.search(r'\bbenign\b', clnsig_norm) and 'pathogen' not in clnsig_norm:
                 continue
-
-            # determine best_class with conflict-handling and combined token rule
+            
+            # Skip conflicting classifications
             if re.search(r'\b(conflict|conflicting|conflicting_classifications)\b', clnsig_norm):
-                # skip conflicting as pathogenic evidence for PM5
                 continue
-
+            
             has_likely = bool(re.search(r'\blikely\s+pathogenic\b', clnsig_norm))
             has_path = bool(re.search(r'\bpathogenic\b', clnsig_norm))
-
             if has_path and has_likely:
                 best_class = "Pathogenic"
             elif has_path:
@@ -2984,7 +3144,6 @@ class DatabaseManager:
             else:
                 best_class = "Unknown"
             
-            # Add detailed entry to results
             results.append({
                 "hgvsp": entry_hgvsp,
                 "clnsig": entry.get('clnsig', ''),
@@ -2994,7 +3153,7 @@ class DatabaseManager:
                 "pos": entry.get('pos', ''),
                 "gene_raw": entry.get('gene_raw', '')
             })
-
+        
         return results
 
 # ---------------------------
@@ -4372,6 +4531,17 @@ class ACMGEngine:
                 except Exception:
                     continue
 
+                # ============================================================
+                # PS1 STAR REQUIREMENT: Only assign PS1 if stars >= 2
+                # ============================================================
+                stars_val = int(info.get("stars", 0) or 0)
+                if stars_val < 2:
+                    # Skip this match for PS1 assignment (insufficient evidence level)
+                    # Optionally log for audit/debug
+                    logger.debug(f"PS1 skipped: match has {stars_val} stars (<2) for {vr.hgvsp}")
+                    continue
+                # ============================================================
+                
                 cln_low = clnsig.lower()
                 if "conflict" in cln_low:
                     vr.ps1_matches.append({"hgvsp": info.get("hgvsp", vr.hgvsp), "clnsig": clnsig, "source": src, "stars": info.get("stars", "")})
@@ -4395,7 +4565,12 @@ class ACMGEngine:
             if not ps1_assigned:
                 # PM5: different AA change at same residue reported pathogenic/likely pathogenic
                 try:
-                    pm5_matches = self.dbm.check_pm5_variants(vr.gene, pos_aa, vr.hgvsp)
+                    # Pass nucleotide coordinates to exclude self-match
+                    pm5_matches = self.dbm.check_pm5_variants(
+                        vr.gene, pos_aa, vr.hgvsp,
+                        current_chrom=vr.chrom, current_pos=vr.pos,
+                        current_ref=vr.ref, current_alt=vr.alt
+                    )
                 except Exception:
                     pm5_matches = []
                 
@@ -4419,10 +4594,12 @@ class ACMGEngine:
             if any(c.startswith("PS1") for c in assigned):
                 # describe matches
                 try:
-                    details = "; ".join([f"{m.get('hgvsp','?')} ({m.get('clnsig','')})" for m in vr.ps1_matches])
+                    # Filter matches to show only those with stars >= 2 (for clarity in output)
+                    valid_matches = [m for m in vr.ps1_matches if int(m.get("stars", 0) or 0) >= 2]
+                    details = "; ".join([f"{m.get('hgvsp','?')} ({m.get('clnsig','')}, ★{m.get('stars','0')})" for m in valid_matches])
                 except Exception:
-                    details = "Matched pathogenic protein change in DB"
-                vr.criteria_explanations["PS1"] = f"PS1: exact same protein change observed in DB: {details}"
+                    details = "Matched pathogenic protein change in DB (stars >= 2)"
+                vr.criteria_explanations["PS1"] = f"PS1: exact same protein change observed in DB with >=2 stars: {details}"
 
         # -------------------------
         # PM2 (population rarity) - MOI specific thresholds
@@ -4527,7 +4704,7 @@ class ACMGEngine:
         rule = self._get_gene_rule(vr.gene) if hasattr(self, "_get_gene_rule") else {}
         acmg_disease = str(rule.get("disease", "") or "").strip()
 
-        # --- ClinVar block (Atomic submission evaluation) ---
+                # --- ClinVar block (Atomic submission evaluation) ---
         clin_block_raw = 0.0
         clin_match_flag = False
         
@@ -4551,10 +4728,22 @@ class ACMGEngine:
             best_submission_info = None
 
             if clin_subs:
+                consensus_stars = 0
+                if hasattr(vr, '_clinvar_consensus_stars') and vr._clinvar_consensus_stars:
+                    try:
+                        consensus_stars = int(vr._clinvar_consensus_stars)
+                    except Exception:
+                        consensus_stars = 0
+                        
                 for sub in clin_subs:
                     sig_raw = str(sub.get("clnsig", "") or "").strip()
                     phen = str(sub.get("phenotype", "")).strip()
-                    stars = int(sub.get("stars", 0) or 0)
+
+                    if consensus_stars > 0:
+                            stars = consensus_stars
+                    else:
+                        stars = int(sub.get("aggregate_stars", sub.get("stars", 0)) or 0)
+
                     sig_norm = re.sub(r'[_\s]+', ' ', sig_raw.lower().strip())
                     
                     # 1. Determine Base Score for THIS submission
@@ -4578,7 +4767,6 @@ class ACMGEngine:
                             sub_base = CLIN_BASE_MAP.get("uncertain significance", -1)
                     
                     # 2. Calculate Final Score for THIS submission (Base * Star Coef)
-                    # IMPORTANT: Stars apply ONLY to this submission's classification
                     coef = CLIN_STAR_COEF.get(stars, 0.5)
                     sub_score = float(sub_base) * float(coef)
                     
@@ -4593,7 +4781,6 @@ class ACMGEngine:
                             pass
                     
                     # 4. Apply Phenotype Penalty if no match for THIS submission
-                    # If phenotype doesn't match, cap the score to [-1.0, +1.0] regardless of stars/class
                     if not sub_phen_match and sub_score != 0:
                         if sub_score > 1.0:
                             sub_score = 1.0
@@ -4601,15 +4788,22 @@ class ACMGEngine:
                             sub_score = -1.0
                     
                     # 5. Track the best valid submission
-                    # We want the maximum absolute impact, preferring Pathogenic over Benign if magnitudes are equal
                     if abs(sub_score) > abs(best_valid_score):
                         best_valid_score = sub_score
+                        # ============================================================
+                        # ENHANCED: Store detailed metadata for audit/transparent output
+                        # ============================================================
                         best_submission_info = {
                             "sig": sig_raw,
+                            "base_points": sub_base,
                             "stars": stars,
+                            "coef": coef,
+                            "raw_score": float(sub_base) * float(coef),
+                            "final_score": sub_score,
                             "phen": phen,
                             "match": sub_phen_match
                         }
+                        # ============================================================
                         if sub_phen_match:
                             clin_match_flag = True
 
@@ -4622,14 +4816,39 @@ class ACMGEngine:
                 vr._clinvar_phenotype_match_level = "submission_level" if best_submission_info["match"] else "no_match"
                 vr._clin_block_raw_display = f"{clin_block_raw:.3f}"
                 vr._best_clinvar_sub = best_submission_info
+                # ============================================================
+                # NEW: Store detailed ClinVar scoring metadata for output
+                # ============================================================
+                vr._clinvar_scoring_details = {
+                    "clinical_significance": best_submission_info["sig"],
+                    "base_points": best_submission_info["base_points"],
+                    "stars": best_submission_info["stars"],
+                    "star_coefficient": best_submission_info["coef"],
+                    "raw_calculation": f"{best_submission_info['base_points']} × {best_submission_info['coef']}",
+                    "phenotype_match": best_submission_info["match"],
+                    "phenotype_penalty_applied": not best_submission_info["match"] and best_submission_info["raw_score"] != best_submission_info["final_score"],
+                    "final_score": best_submission_info["final_score"]
+                }
+                # ============================================================
             else:
                 vr._clinvar_phenotype_match = False
                 vr._clin_block_raw_display = "0.000"
+                vr._clinvar_scoring_details = {
+                    "clinical_significance": "No submissions",
+                    "base_points": 0,
+                    "stars": 0,
+                    "star_coefficient": 0,
+                    "raw_calculation": "N/A",
+                    "phenotype_match": False,
+                    "phenotype_penalty_applied": False,
+                    "final_score": 0.0
+                }
 
         except Exception as e:
             logger.debug(f"ClinVar block calculation failed: {e}")
             clin_block_raw = 0.0
             clin_match_flag = False
+            vr._clinvar_scoring_details = {"error": str(e)}
 
         # --- HGMD block (per-variant) ---
         hgmd_class_raw = (vr.hgmd_class or "").strip()
@@ -4689,15 +4908,23 @@ class ACMGEngine:
         hgmd_trait_text = str(vr.hgmd_phen or "")
         if acmg_disease and hgmd_trait_text:
             try:
-                matched_h, match_level_h, match_reason_h = check_disease_match(acmg_disease, hgmd_trait_text)
+                acmg_disease_tokens = [d.strip() for d in re.split(r'[;/\|]+', acmg_disease) if d.strip()]
+                matched_h = False
+                for dtk in acmg_disease_tokens:
+                    if not dtk:
+                        continue
+                    m, match_level_h, match_reason_h = check_disease_match(dtk, hgmd_trait_text)
+                    if m:
+                        matched_h = True
+                        break
                 hgmd_match_flag = bool(matched_h)
-                hgmd_match_level = match_level_h or ""
-                hgmd_match_reason = match_reason_h or ""
+                hgmd_match_level = match_level_h if matched_h else ""
+                hgmd_match_reason = match_reason_h if matched_h else ""
             except Exception:
                 hgmd_match_flag = False
                 hgmd_match_level = ""
                 hgmd_match_reason = ""
-        # persist HGMD phenotype-match meta on the variant record for downstream audit
+        
         try:
             vr._hgmd_phenotype_match = bool(hgmd_match_flag)
             vr._hgmd_phenotype_match_level = str(hgmd_match_level)
@@ -4706,15 +4933,32 @@ class ACMGEngine:
             pass
 
         # If no phenotype match in HGMD, cap HGMD block to [-1.0, +1.0]
+        hgmd_raw_score = hgmd_block_raw
         if not hgmd_match_flag:
             if hgmd_block_raw > 1.0:
                 hgmd_block_raw = 1.0
             elif hgmd_block_raw < -1.0:
                 hgmd_block_raw = -1.0
 
+        # ============================================================
+        # NEW: Store detailed HGMD scoring metadata for output
+        # ============================================================
+        vr._hgmd_scoring_details = {
+            "hgmd_class": hgmd_class_raw if hgmd_class_raw else "Not found",
+            "class_points": hgmd_class_points,
+            "publications": hgmd_pub_count,
+            "dm_supported": hgmd_dmsup,
+            "dm_support_ratio": f"{hgmd_dmsup}/{hgmd_pub_count}" if hgmd_pub_count > 0 else "N/A",
+            "support_coefficient": hgmd_pub_coef,
+            "raw_calculation": f"{hgmd_class_points} × {hgmd_pub_coef}",
+            "phenotype_match": hgmd_match_flag,
+            "phenotype_penalty_applied": not hgmd_match_flag and hgmd_raw_score != hgmd_block_raw,
+            "final_score": hgmd_block_raw
+        }
+        # ============================================================
+
         # Sum blocks and map to PP5ext/BP5ext strength
         raw_total = clin_block_raw + hgmd_block_raw
-
         applied_ext_key = None
         applied_ext_points = 0
         # mapping ranges:
@@ -4752,7 +4996,6 @@ class ACMGEngine:
         try:
             total_ext = int(sum(int(vp) for vp in pts_ext.values()))
         except Exception:
-            # defensive fallback
             try:
                 total_ext = int(round(sum(float(vp) for vp in pts_ext.values())))
             except Exception:
@@ -4800,7 +5043,36 @@ class ACMGEngine:
         vr._applied_ext_key = applied_ext_key or ""
         vr._clinvar_phenotype_match = bool(clin_match_flag)
         vr._hgmd_phenotype_match = bool(hgmd_match_flag)
-        vr._pp5ext_explanation = f"clin={clin_block_raw:.3f}, hgmd={hgmd_block_raw:.3f}, raw_total={raw_total:.3f}, applied={applied_ext_key}"
+        
+        clin_details = vr._clinvar_scoring_details if hasattr(vr, "_clinvar_scoring_details") and vr._clinvar_scoring_details else {}
+        hgmd_details = vr._hgmd_scoring_details if hasattr(vr, "_hgmd_scoring_details") and vr._hgmd_scoring_details else {}
+
+        # Build ClinVar explanation part
+        if clin_details and clin_details.get("clinical_significance") != "No submissions":
+            pp5_clin_block_str = (
+                f"sig={clin_details.get('clinical_significance', 'N/A')} ({clin_details.get('base_points', 0)} points), "
+                f"stars={clin_details.get('stars', 0)} ({clin_details.get('star_coefficient', 0)} coef), "
+                f"clinvar_phenotype_match={'Yes' if clin_details.get('phenotype_match', False) else 'No'}"
+                f"{' [PENALTY APPLIED]' if clin_details.get('phenotype_penalty_applied', False) else ''}, "
+                f"clin={clin_details.get('final_score', 0):.3f}"
+            )
+        else:
+            pp5_clin_block_str = "No ClinVar submissions"
+
+        # Build HGMD explanation part
+        if hgmd_details and hgmd_details.get("hgmd_class") != "Not found":
+            pp5_hgmd_block_str = (
+                f"class={hgmd_details.get('hgmd_class', 'N/A')} ({hgmd_details.get('class_points', 0)} points), "
+                f"pubs={hgmd_details.get('publications', 0)}, dm_supported={hgmd_details.get('dm_supported', 0)} ({hgmd_details.get('dm_support_ratio', 'N/A')}), "
+                f"coef={hgmd_details.get('support_coefficient', 0)}, "
+                f"hgmd_phenotype_match={'Yes' if hgmd_details.get('phenotype_match', False) else 'No'}"
+                f"{' [PENALTY APPLIED]' if hgmd_details.get('phenotype_penalty_applied', False) else ''}, "
+                f"hgmd={hgmd_details.get('final_score', 0):.3f}"
+            )
+        else:
+            pp5_hgmd_block_str = "No HGMD entry"
+
+        vr._pp5ext_explanation = f"{pp5_clin_block_str} | {pp5_hgmd_block_str} | raw_total={raw_total:.3f}, applied={applied_ext_key}"
 
         try:
             if hasattr(vr, "extended_class") and vr.extended_class:
@@ -4812,15 +5084,11 @@ class ACMGEngine:
 
         logger.debug("Variant %s:%s assigned pts=%s total_ext=%s extended_class=%s automated_class=%s",
                     vr.chrom, vr.pos, vr.criteria_points, getattr(vr, "total_ext_points", None), getattr(vr, "extended_class", None), getattr(vr, "automated_class", None))
-        # make automated_class reflect extended_class (if non-VUS) so downstream triage sees ext scoring 
+        
         try:
-            # If the extended model produced a non-VUS class, prefer it as the automated class
             if extended_class and extended_class != "VUS":
                 auto_class = extended_class
-            # persist for other code that expects this attribute
             vr.automated_class = auto_class
-            # also persist "final" points used for automated class (prefer pts_ext if it influenced class)
-            # store both for debugging/audit
             vr.criteria_points_final = pts_ext if extended_class and extended_class != "VUS" else pts
             vr.total_points_final = sum(int(x) for x in (vr.criteria_points_final or {}).values())
             logger.debug("Variant scoring summary: pts=%s total=%s pts_ext=%s total_ext=%s automated_class=%s extended_class=%s",
@@ -4883,26 +5151,32 @@ class ACMGEngine:
         # CRITICAL GUARD: Enforce minimum criteria count for Pathogenic classification
         # - Pathogenic requires >2 pathogenic criteria (>2, не >=2)
         # - If exactly 2 criteria present -> downgrade to Likely pathogenic
+        # - IMPORTANT: Downgrade does NOT prevent auto-report if LP has >=6 points
         # =========================================================================
         try:
             path_cnt = sum(1 for x in assigned if any(p in x for p in ["PVS", "PS", "PM", "PP"]))
-            
             if vr.automated_class == "Pathogenic":
                 if path_cnt <= 2:
+                    # Downgrade to Likely Pathogenic
                     vr.automated_class = "Likely pathogenic"
                     vr.extended_class = "Likely pathogenic"
-                    note = f"Downgraded Pathogenic -> Likely pathogenic: only {path_cnt} pathogenic criteria present (requires >2)"
-                    if note not in vr.manual_reasons:
-                        vr.manual_reasons.append(note)
-            
+                    # Store downgrade info in criteria_explanations (NOT manual_reasons)
+                    # so it doesn't trigger manual review escalation
+                    vr.criteria_explanations["Pathogenic_downgrade"] = (
+                        f"Downgraded Pathogenic -> Likely pathogenic: only {path_cnt} pathogenic criteria present (requires >2). "
+                        f"Auto-report still allowed if total_ext_points >= 6."
+                    )
+                    # Calculate if this LP qualifies for auto-report (>=6 points)
+                    current_points = int(sum(int(x) for x in (vr.criteria_points_ext or vr.criteria_points or {}).values()))
+                    if current_points >= 6:
+                        # Mark that this variant should still be considered for auto-report despite downgrade
+                        vr._downgraded_lp_auto_eligible = True
+                        logger.debug(f"Variant {vr.chrom}:{vr.pos} downgraded to LP but eligible for auto (points={current_points})")
             elif vr.automated_class == "Likely pathogenic":
                 if path_cnt < 1:
                     vr.automated_class = "VUS"
                     vr.extended_class = "VUS"
-                    note = "Downgraded Likely pathogenic -> VUS: no strong pathogenic criteria"
-                    if note not in vr.manual_reasons:
-                        vr.manual_reasons.append(note)
-                        
+                    vr.criteria_explanations["LP_downgrade"] = "Downgraded Likely pathogenic -> VUS: no strong pathogenic criteria"
         except Exception as e:
             logger.debug(f"Failed to apply criteria count guard: {e}")
 
@@ -5473,6 +5747,25 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                         vv._in_manual = False
                         continue
 
+                    # This prevents low-score VUS from being flagged as delins parts
+                    if getattr(vv, "automated_class", "") == "VUS":
+                        vus_pts = int(getattr(vv, "total_points", 0) or 0)
+                        if vus_pts < 5:
+                            vv._delins_flag = False
+                            vv.is_delins_part = False
+                            vv._filtered = True
+                            vv._in_auto = False
+                            vv._in_manual = False
+                            low_score_note = (
+                                f"Filtered: VUS with {vus_pts} points (<5) excluded from delins cluster "
+                                f"(cluster_id={cluster_counter})"
+                            )
+                            if low_score_note not in vv.manual_reasons:
+                                vv.manual_reasons.append(low_score_note)
+                            if low_score_note not in vv.filtered_reasons:
+                                vv.filtered_reasons.append(low_score_note)
+                            continue  # Skip delins flagging for this variant
+
                     # find same-gene pathogenic members for this variant
                     same_gene_paths = [p for p in pathogenic_members if normalize_gene_name(p.gene or p.gene_raw) == normalize_gene_name(vv.gene or vv.gene_raw)]
                     if not same_gene_paths:
@@ -5487,6 +5780,18 @@ def detect_delins(candidates: List[VariantRecord]) -> None:
                         continue
 
                     dist = _min_dist_to_path_same_gene(vv, same_gene_paths)
+
+                    # ============================================================
+                    # EXTRA FILTER: Skip VUS with <5 points even if near pathogenic
+                    # This prevents low-score VUS from being flagged as delins parts
+                    # ============================================================
+                    if getattr(vv, "automated_class", "") == "VUS":
+                        vus_pts = int(getattr(vv, "total_points", 0) or 0)
+                        if vus_pts < 5:
+                            vv._delins_flag = False
+                            vv.is_delins_part = False
+                            continue  # Skip delins flagging for this variant
+
                     if dist <= ADJ_THRESHOLD:
                         vv._delins_flag = True
                         vv._delins_cluster_id = cluster_counter
@@ -5901,7 +6206,16 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
             phen = str(sub.get("phenotype", "")).strip()
             if acmg_disease and phen:
                 try:
-                    matched, _, _ = check_disease_match(acmg_disease, phen)
+                    # Split ACMG disease string into tokens for proper phenotype matching
+                    acmg_disease_tokens = [d.strip() for d in re.split(r'[;/\|]+', acmg_disease) if d.strip()]
+                    matched = False
+                    for dtk in acmg_disease_tokens:
+                        if not dtk:
+                            continue
+                        m, _, _ = check_disease_match(dtk, phen)
+                        if m:
+                            matched = True
+                            break
                     if matched:
                         matching_subs.append(sub)
                 except Exception:
@@ -5926,25 +6240,25 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
     clin_sigs = []
     clin_phens = []
     clin_stars_seq = []
-
     for s in clin_subs:
         sig = str(s.get("clnsig","")).strip()
         phen = str(s.get("phenotype","")).strip()
-        star = str(int(s.get("stars", 0) or 0))
-        
+
+        if hasattr(v, '_clinvar_consensus_stars') and v._clinvar_consensus_stars:
+            star = str(v._clinvar_consensus_stars)
+        else:
+            star = str(int(s.get("aggregate_stars", s.get("stars", 0)) or 0))
+
         if sig and sig.lower() not in ("not provided", ".", "null"):
             clin_sigs.append(sig)
         else:
             clin_sigs.append("Not provided")
-        
         if phen and phen.lower() not in (".", "null"):
             phen_clean = re.sub(r'^(C\d{7}|MIM:\d+):', '', phen).strip()
             clin_phens.append(phen_clean)
         else:
             clin_phens.append("Not provided")
-        
         clin_stars_seq.append(star)
-
     # Join fields with semicolon separator to create output strings
     # Submissions are listed in order with parallel fields (sig;sig;sig vs trait;trait;trait vs stars;stars;stars)
     clinvar_sig_field = ";".join(clin_sigs) if clin_sigs else "Not provided"
@@ -6002,11 +6316,40 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
     if clin_block:
         clinvar_match_field += f"; clin_block={clin_block}"
 
+    
+    
     hgmd_block = getattr(v, "_hgmd_block_raw_display", "")
     hgmd_phen_text = v.hgmd_phen if v.hgmd_phen and v.hgmd_phen.lower() not in (".","not provided","") else "Not provided"
     hgmd_match_field = f"HGMD_class={v.hgmd_class or 'Not provided'}; phen=\"{hgmd_phen_text}\"; pubs={getattr(v,'hgmd_publication_count',0)}; dmsup={getattr(v,'hgmd_dmsupported',0)}"
     if hgmd_block:
         hgmd_match_field += f"; hgmd_block={hgmd_block}"
+
+    # ClinVar block detailed string
+    clin_details = v._clinvar_scoring_details if hasattr(v, "_clinvar_scoring_details") and v._clinvar_scoring_details else {}
+    if clin_details and clin_details.get("clinical_significance") != "No submissions":
+        pp5_clin_block_str = (
+            f"sig={clin_details.get('clinical_significance', 'N/A')} ({clin_details.get('base_points', 0)} points), "
+            f"stars={clin_details.get('stars', 0)} ({clin_details.get('star_coefficient', 0)} coef), "
+            f"clinvar_phenotype_match={'Yes' if clin_details.get('phenotype_match', False) else 'No'}"
+            f"{' [PENALTY APPLIED]' if clin_details.get('phenotype_penalty_applied', False) else ''}, "
+            f"clin={clin_details.get('final_score', 0):.3f}"
+        )
+    else:
+        pp5_clin_block_str = "No ClinVar submissions"
+
+    # HGMD block detailed string
+    hgmd_details = v._hgmd_scoring_details if hasattr(v, "_hgmd_scoring_details") and v._hgmd_scoring_details else {}
+    if hgmd_details and hgmd_details.get("hgmd_class") != "Not found":
+        pp5_hgmd_block_str = (
+            f"class={hgmd_details.get('hgmd_class', 'N/A')} ({hgmd_details.get('class_points', 0)} points), "
+            f"pubs={hgmd_details.get('publications', 0)}, dm_supported={hgmd_details.get('dm_supported', 0)} ({hgmd_details.get('dm_support_ratio', 'N/A')}), "
+            f"coef={hgmd_details.get('support_coefficient', 0)}, "
+            f"hgmd_phenotype_match={'Yes' if hgmd_details.get('phenotype_match', False) else 'No'}"
+            f"{' [PENALTY APPLIED]' if hgmd_details.get('phenotype_penalty_applied', False) else ''}, "
+            f"hgmd={hgmd_details.get('final_score', 0):.3f}"
+        )
+    else:
+        pp5_hgmd_block_str = "No HGMD entry"
 
     # comments: default empty; for auto variants we will move informational manual_reasons here later (in triage)
     comments_field = ""
@@ -6046,6 +6389,10 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "clinvar_trait": clinvar_trait_field,
         "clinvar_sig": clinvar_sig_field,
         "clinvar_stars": clinvar_stars_field,
+        "clinvar_consensus_class": getattr(v, "_clinvar_consensus_class", "Not provided"),
+        "clinvar_consensus_stars": getattr(v, "_clinvar_consensus_stars", "0"),
+        "clinvar_aggregate_stars": str(max([int(s) for s in clin_stars_seq]) if clin_stars_seq else 0),  
+        "clinvar_phenotype_match_method": getattr(v, "_clinvar_phenotype_match_method", "N/A"),
         "hgmd_class": v.hgmd_class or "Not provided",
         "hgmd_phenotype": hgmd_phen or "Not provided",
         "hgmd_publication_count": v.hgmd_publication_count,
@@ -6065,8 +6412,8 @@ def variant_row_with_disease(v: VariantRecord, rule: Dict[str,Any], family_id: s
         "total_ext_points": getattr(v, "total_ext_points", ""),
         "extended_class": getattr(v, "extended_class", ""),
         "PP5ext_BP5ext_expl": getattr(v, "_pp5ext_explanation", ""),
-        "PP5_clin_block": getattr(v, "_clin_block_raw_display", ""),
-        "PP5_hgmd_block": getattr(v, "_hgmd_block_raw_display", ""),
+        "PP5_clin_block": pp5_clin_block_str,
+        "PP5_hgmd_block": pp5_hgmd_block_str,
         "PP5_raw_total": f"{getattr(v, '_pp5_raw_total', 0.0):.3f}" if getattr(v, "_pp5_raw_total", None) is not None else "",
         "PP5_applied": getattr(v, "_applied_ext_key", ""),
         "phase": v.phase,
@@ -6216,6 +6563,33 @@ def strict_triage_and_output(
     os.makedirs(outdir, exist_ok=True)
     family_id = family_id_input or "Unknown"
     candidates = list(report_candidates or []) + list(audit_candidates or [])
+
+        # ... existing code: candidates = list(report_candidates or []) + ...
+    
+    # ============================================================
+    # FILTER: Exclude VUS with <5 points from all reporting paths
+    # This applies globally: auto, manual, and delins detection
+    # ============================================================
+    filtered_vus_low_score = []
+    for v in candidates:
+        if getattr(v, "automated_class", "") == "VUS":
+            total_pts = int(getattr(v, "total_points", 0) or 0)
+            if total_pts < 5:
+                # Mark as filtered with explicit reason
+                if not hasattr(v, "filtered_reasons") or v.filtered_reasons is None:
+                    v.filtered_reasons = []
+                reason = "Filtered: VUS with <5 points excluded from all reporting paths (auto/manual/delins)"
+                if reason not in v.filtered_reasons:
+                    v.filtered_reasons.append(reason)
+                # Ensure variant is excluded from all output lists
+                v._filtered = True
+                v._in_auto = False
+                v._in_manual = False
+                v.is_delins_part = False  # Explicitly exclude from delins
+                filtered_vus_low_score.append(v)
+                continue
+    if filtered_vus_low_score:
+        logger.info(f"Filtered {len(filtered_vus_low_score)} VUS variants with <5 points from all reporting paths")
 
     # Diagnostic logging: show counts to help debugging when pipeline runs in batch mode.
     logger.info("strict_triage_and_output: report_candidates=%d, audit_candidates=%d, total_candidates=%d",
@@ -7419,18 +7793,19 @@ def strict_triage_and_output(
                     # only consider clusters with >=2 variants
                     if not members or len(members) < 2:
                         continue
-                    # check per-variant criterion: each variant must be HQ P/LP OR total_points > 5
+                    # check per-variant criterion: each variant must be P/LP OR total_points > 5
                     all_meet = True
                     for m in members:
                         meets = False
                         try:
-                            if getattr(m, "is_hq_pathogenic_db", False):
+                            if getattr(m, "automated_class", "") in ("Pathogenic", "Likely pathogenic"):
+                                # P/LP variants always meet criteria for delins
                                 meets = True
-                            elif getattr(m, "automated_class", "") in ("Pathogenic", "Likely pathogenic") and getattr(m, "total_points", 0) > 5:
-                                # If automated_class is P/LP and total_points > 5 -> meets
-                                meets = True
-                            elif getattr(m, "total_points", 0) > 5:
-                                meets = True
+                            elif getattr(m, "automated_class", "") == "VUS":
+                                # VUS must have >5 points to be considered for delins manual escalation
+                                if getattr(m, "total_points", 0) > 5:
+                                    meets = True
+                            # Note: variants with <5 points do NOT meet criteria
                         except Exception:
                             meets = False
                         if not meets:
@@ -7585,17 +7960,22 @@ def strict_triage_and_output(
                 except Exception:
                     ext_cls = getattr(v, "automated_class", "")
                     ext_pts = int(getattr(v, "total_points", 0) or 0)
-
                 if ((ext_cls == "Pathogenic" and ext_pts >= 10) or
-                    (ext_cls == "Likely pathogenic" and ext_pts >= 6)):
+                        (ext_cls == "Likely pathogenic" and ext_pts >= 6)):
                     if getattr(v, "is_hq_conflict_db", False):
                         # conflicts must be manual-reviewed
                         pass
                     else:
-                        if v._disease_match or (v._disease_match_reason == "no_db_phenotype") or (not v._has_db_evidence):
+                        # CRITICAL FIX: Allow auto-report for downgraded LP variants with >=6 points
+                        # Check disease match OR if variant was downgraded from Pathogenic (still reportable)
+                        is_downgraded_lp = getattr(v, "_downgraded_lp_auto_eligible", False)
+                        if v._disease_match or (v._disease_match_reason == "no_db_phenotype") or (not v._has_db_evidence) or is_downgraded_lp:
                             v._in_auto = True
                             v._filtered = False
-                            v.auto_report_reasons.append("Extended score")
+                            if is_downgraded_lp:
+                                v.auto_report_reasons.append("Extended score (downgraded LP with >=6 points)")
+                            else:
+                                v.auto_report_reasons.append("Extended score")
                             auto_ids.add(get_key(v))
 
             # --- MANUAL LOGIC ---
@@ -7772,39 +8152,34 @@ def strict_triage_and_output(
                         vus_le4 = [p for p in partners if p.automated_class == "VUS" and (getattr(p, "total_points", 0) <= 4)]
                         other_plp_partners = [p for p in partners if p.automated_class in ("Pathogenic", "Likely pathogenic")]
 
-                        # CASE: Multiple VUS with >=5 points -> send all related variants (primary + all vus5) to manual.
+                        # CASE: Multiple VUS with >=5 points together with P/LP -> manual
                         if len(vus5) >= 2:
                             for pvar in ([primary] + vus5):
+                                # Double-check points threshold before adding to manual
+                                if pvar.automated_class == "VUS":
+                                    vus_pts = getattr(pvar, "total_points", 0) or 0
+                                    if vus_pts < 5:
+                                        continue  # Skip VUS with <5 points
                                 if get_key(pvar) not in manual_ids:
                                     pvar.manual_reasons.append("Manual: Recessive gene with multiple heterozygous VUS (>=5 points) together with P/LP -> phasing/pairing review required")
                                     pvar._in_manual = True; pvar._filtered = False; pvar._in_auto = False
                                     manual_ids.add(get_key(pvar))
                                     if get_key(pvar) in auto_ids:
                                         auto_ids.remove(get_key(pvar))
-                            # we handled this primary, move to next
                             continue
 
-                        # CASE: Single VUS with >=5 points: require confirmed trans to send to manual
+                        # CASE: Single VUS with >=5 points: ALWAYS send to manual (no trans confirmation required)
+                        # all P/LP + VUS(>=5) pairs go to manual review
                         if len(vus5) == 1:
                             partner = vus5[0]
-                            in_trans_confirmed = _confirm_trans(primary, partner)
-                            if in_trans_confirmed:
-                                # send both to manual for pairing review
-                                for pvar in (primary, partner):
-                                    if get_key(pvar) not in manual_ids:
-                                        pvar.manual_reasons.append("Manual: Recessive pair confirmed in trans: P/LP + VUS(>=5) -> phasing/pairing review required")
-                                        pvar._in_manual = True; pvar._filtered = False; pvar._in_auto = False
-                                        manual_ids.add(get_key(pvar))
-                                        if get_key(pvar) in auto_ids:
-                                            auto_ids.remove(get_key(pvar))
-                            else:
-                                # not confirmed trans -> conservative: do not report (carrier); do not send anywhere
-                                # add an informational note (will end up in comments for auto variants)
-                                note = "AR pairing candidate: P/LP + single VUS(>=5) found but not confirmed in trans -> conservative: not reported (carrier)."
-                                if note not in primary.manual_reasons:
-                                    primary.manual_reasons.append(note)
-                                if note not in partner.manual_reasons:
-                                    partner.manual_reasons.append(note)
+                            # Send both to manual for pairing review WITHOUT requiring confirmed trans
+                            for pvar in (primary, partner):
+                                if get_key(pvar) not in manual_ids:
+                                    pvar.manual_reasons.append("Manual: Recessive pair candidate: P/LP + VUS(>=5) -> phasing/pairing review required (trans not confirmed)")
+                                    pvar._in_manual = True; pvar._filtered = False; pvar._in_auto = False
+                                    manual_ids.add(get_key(pvar))
+                                    if get_key(pvar) in auto_ids:
+                                        auto_ids.remove(get_key(pvar))
                             continue
 
                         # CASE: No VUS>=5 present:
@@ -7821,16 +8196,36 @@ def strict_triage_and_output(
                             continue
 
                         # CASE: Other combinations (e.g., other P/LP partners, mixed classes)
-                        # Fall back to previous conservative behavior: attempt to confirm trans and if confirmed send to manual for pairing review.
+                        # VUS must have >=5 points to be considered for AR pairing manual review
+                        # Do NOT send VUS with <5 points to manual review unless there are >=2 P/LP hets
                         for partner in partners:
                             # skip if partner is the same as primary
                             if partner is primary:
                                 continue
+                            
+                            # === CRITICAL FIX: Check VUS points threshold ===
+                            # VUS with <5 points should NOT trigger manual review for AR pairing
+                            if partner.automated_class == "VUS":
+                                partner_pts = getattr(partner, "total_points", 0) or 0
+                                if partner_pts < 5:
+                                    # Skip this partner - VUS with <5 points is not significant for AR pairing
+                                    continue
+                            
                             in_trans_confirmed = _confirm_trans(primary, partner)
                             if in_trans_confirmed:
-                                # If partner is VUS with points >=1 we may still want manual review
-                                # Conservative rule: confirmed trans with P/LP and any other (VUS>=1) -> manual pairing review
-                                if partner.automated_class in ("Pathogenic", "Likely pathogenic"):
+                                # If partner is VUS with points >=5 we may send to manual review
+                                if partner.automated_class == "VUS":
+                                    partner_pts = getattr(partner, "total_points", 0) or 0
+                                    if partner_pts >= 5:
+                                        for pvar in (primary, partner):
+                                            if get_key(pvar) not in manual_ids:
+                                                pvar.manual_reasons.append("Manual: Recessive pair confirmed in trans -> phasing/pairing review required")
+                                                pvar._in_manual = True; pvar._filtered = False; pvar._in_auto = False
+                                                manual_ids.add(get_key(pvar))
+                                                if get_key(pvar) in auto_ids:
+                                                    auto_ids.remove(get_key(pvar))
+                                        break
+                                elif partner.automated_class in ("Pathogenic", "Likely pathogenic"):
                                     # two P/LP in trans -> manual
                                     for pvar in (primary, partner):
                                         if get_key(pvar) not in manual_ids:
@@ -7839,19 +8234,7 @@ def strict_triage_and_output(
                                             manual_ids.add(get_key(pvar))
                                             if get_key(pvar) in auto_ids:
                                                 auto_ids.remove(get_key(pvar))
-                                else:
-                                    # partner is VUS or other; require at least 1 point and then send to manual
-                                    if getattr(partner, "total_points", 0) >= 1:
-                                        for pvar in (primary, partner):
-                                            if get_key(pvar) not in manual_ids:
-                                                pvar.manual_reasons.append("Manual: Recessive pair confirmed in trans -> phasing/pairing review required")
-                                                pvar._in_manual = True; pvar._filtered = False; pvar._in_auto = False
-                                                manual_ids.add(get_key(pvar))
-                                                if get_key(pvar) in auto_ids:
-                                                    auto_ids.remove(get_key(pvar))
-                                # break after handling this partner for this primary
-                                break
-                            # if not confirmed -> continue trying other partners
+                                    break
 
     # --- Build output rows (augment with explanations) ---
     # Define columns including per-criterion explanation columns
@@ -7861,7 +8244,9 @@ def strict_triage_and_output(
         "acmg_disease_association","Special_Guidance", "Rules_applied",
         "clinvar_phenotype_match","clinvar_phenotype_info",
         "hgmd_phenotype_match","hgmd_phenotype_info",
-        "clinvar_trait","clinvar_sig","clinvar_stars",
+        "clinvar_trait","clinvar_sig","clinvar_stars", "clinvar_consensus_class",
+        "clinvar_consensus_stars", "clinvar_aggregate_stars",
+        "clinvar_phenotype_match_method",
         "hgmd_class","hgmd_phenotype","hgmd_publication_count","hgmd_rankscore", "hgmd_dmsupported",
         "internal_db_sig","database_summary",
         "gnomAD_AF","gnomAD_version",
@@ -9598,6 +9983,8 @@ def build_parser():
                    help="CSV/TSV with Ensembl <-> RefSeq mapping (columns: Ensembl_rna_identifier, RNA_nucleotide_accession.version, mane_select)")
     p.add_argument("--nmd-table", dest="nmd_table",
                    help="Precomputed NMD/exons table (tab/tsv) with columns including Transcript_ID, total_cds_exons, CDS_length, Protein_length, number_cds_exon, CDS_Exon_length")
+    p.add_argument("--clinvar-expanded-acmg", 
+                     help="Path to ClinVar expanded ACMG SF CSV (from clinvar_acmg_sf_prep.py)")
     return p
 
 def process_single_sample_worker(payload):
@@ -9750,6 +10137,9 @@ def main():
             db_paths.update(json.load(fh))
     if args.hgmd:
         db_paths["HGMD_VCF"] = args.hgmd
+    if hasattr(args, 'clinvar_expanded_acmg') and args.clinvar_expanded_acmg and os.path.exists(args.clinvar_expanded_acmg):
+        db_paths["CLINVAR_EXPANDED_CSV"] = args.clinvar_expanded_acmg
+        logger.info(f"Using ACMG SF ClinVar expanded file: {db_paths['CLINVAR_EXPANDED_CSV']}")
     if args.batch_input_dir:
         run_batch_mode(args, db_paths)
     elif args.proband:
