@@ -79,3 +79,4 @@ pip-log.txt
 
 # Логи
 *.log
+vep_results/
