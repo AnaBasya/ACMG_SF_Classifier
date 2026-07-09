@@ -382,4 +382,3 @@ This work was supported by the Research Centre For Medical Genetics. The authors
 
 
 *Developed for clinical NGS workflows at RCMG ("Genome" Centre).*  
-```
