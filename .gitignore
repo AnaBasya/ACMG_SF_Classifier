@@ -80,3 +80,4 @@ pip-log.txt
 # Логи
 *.log
 vep_results/
+/scripts/am_i_trying.py
