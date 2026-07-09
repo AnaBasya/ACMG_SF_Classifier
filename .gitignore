@@ -3,6 +3,25 @@
 # Ignore large database folders and generated results
 /databases/
 /results/
+/points*
+/1pts*
+/2pts*
+/3pts*
+/4pts*
+/5pts*
+/6pts*
+/all_15*
+/parkinson*
+/vep_results/
+/no_vep_result/
+acmg_sf_classifier_PARKINSONS_3_points.py
+acmg_sf_classifier_POINTS_1_points.py
+acmg_sf_classifier_POINTS_2_points.py
+acmg_sf_classifier_POINTS_4_points.py
+acmg_sf_classifier_POINTS_5_points.py
+acmg_sf_classifier_POINTS_6_points.py
+acmg_sf_classifier_POINTS.py
+/data/
 /temp/
 /data/
 /preprocessing/*
@@ -15,6 +34,7 @@
 /databases/gnomad/*
 /batch_results/
 /batch_results/*
+clinvar*
 # VEP caches, local DB builds
 /databases/vep/
 /databases/gnomad/
